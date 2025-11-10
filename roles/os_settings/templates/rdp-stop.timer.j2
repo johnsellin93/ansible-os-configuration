@@ -1,0 +1,10 @@
+[Unit]
+Description=Stop {{ rdp_service }} at {{ rdp_timer_pause }}
+
+[Timer]
+OnCalendar={{ rdp_timer_pause }}
+Persistent=false
+RandomizedDelaySec=0
+
+[Install]
+WantedBy=timers.target

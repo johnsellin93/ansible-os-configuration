@@ -1,0 +1,15 @@
+# local / sensitive / junk - do NOT commit
+cfg/
+db*.txt
+uat/
+disk_swap.sh
+enviroment.conf
+hosts.ini
+
+# logs, temp
+*.log
+*.tmp
+
+# installer binaries - never in git
+roles/s1_r7_install/files/*.deb
+roles/s1_r7_install/files/*.rpm

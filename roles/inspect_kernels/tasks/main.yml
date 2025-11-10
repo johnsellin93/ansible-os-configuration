@@ -1,0 +1,28 @@
+- name: List installed kernels (safe, non-destructive)
+  ansible.builtin.command: rpm -q kernel --last
+  register: rhck
+  changed_when: false
+  failed_when: false
+
+- name: UEK kernels (newest first)
+  ansible.builtin.command: rpm -q kernel-uek --last
+  register: uek
+  changed_when: false
+  failed_when: false
+
+- name: Default boot kernel (if grubby exists)
+  ansible.builtin.command: grubby --default-kernel
+  register: grubby_def
+  changed_when: false
+  failed_when: false
+  args: { warn: false }
+
+- name: Pretty output
+  ansible.builtin.debug:
+    msg:
+      - "Running kernel:  {{ ansible_kernel }}"
+      - "Default boot:   {{ grubby_def.stdout | default('unknown') }}"
+      - "RHCK kernels:"
+      - "{{ rhck.stdout_lines | default(['(none)']) }}"
+      - "UEK kernels:"
+      - "{{ uek.stdout_lines | default(['(none)']) }}"

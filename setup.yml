@@ -1,0 +1,153 @@
+---
+- name: security maintenance
+  hosts: "{{ target | default('NO_HOSTS_SELECTED') }}"
+  gather_facts: true
+  become: true
+  serial: 2
+  # ansible-playbook -i hosts.ini setup.yml -e target=testvm-rhel --tags selinux
+  tasks:
+
+    - name: kernel_cleanup_and_upgrade #RHEL
+      tags: kernel_cleanup_and_upgrade
+      block:
+        # roles/kernel_cleanup_and_upgrade/README.md for full behavior & rollback notes.
+        - include_role:
+            name: kernel_cleanup_and_upgrade
+          vars:
+            kernel_stream: "both"          # "uek", "rhck", or "both"
+            installonly_limit_value: 2
+            boot_min_free_mb: 360
+
+
+    - name: s1_r7
+      tags: s1_r7_install
+      block:
+        - include_role:
+            name: s1_r7_install
+          vars:
+            rapid7_token: "{{ lookup('env','R7_TOKEN') }}"
+            sentinelone_site_token: "{{ lookup('env','S1_TOKEN') }}"
+            s1_pkg_src: "./SentinelAgent_linux_x86_64_v24_3_1_29.rpm"
+            r7_pkg_src: "./rapid7-insight-agent-4.0.13.32-1.x86_64.rpm"
+
+
+    - name: selinux security
+      tags: selinux
+      block:
+        - include_role:
+            name: selinux
+          vars:
+            selinux_denials_log_path: "/var/log/audit/audit.log" # Audit log used for troubleshooting SELinux denials.
+            selinux_state: enforcing
+            selinux_policy: targeted
+            selinux_fcontexts:  # Example paths explicitly allowed after SELinux denials observed
+              - { path: "/etc/init.d/appstart", setype: "initrc_exec_t" }
+              - { path: "/opt/appsuite/inventory(/.*)?", setype: "var_t" }
+              - { path: "/opt/appsuite/shared(/.*)?", setype: "var_t" }
+              - { path: "/opt/appsuite/bin(/.*)?", setype: "bin_t" }
+              - { path: "/opt/appsuite/log(/.*)?", setype: "var_log_t" }
+              - { path: "/opt/monitoring/agent/agentd", setype: "bin_t" }
+              - { path: "/opt/monitoring/agent(/.*)?", setype: "var_t" }
+          when:
+            - ansible_facts.os_family == 'RedHat'
+            - "'db' in group_names"
+
+    - name: os
+      tags: os_settings
+      block:
+        - name: os_settings role
+          include_role:
+            name: os_settings
+          vars:
+
+            oracle_shutdown_user: oracle # roles/os_settings/templates/oracle-pre-shutdown.service.j2
+            oracle_shutdown_cmd: "/home/oracle/scripts/stop.sh >> /home/oracle/scripts/startup_shutdown.log 2>&1"  # Oracle DB service stopped before reboot via oracle-pre-shutdown.service before any system reboot, halt, or poweroff
+
+            python_venv_dir: /opt/pyenv
+            python_version: 3.13.0
+            env_global: true # expose python venv system-wide (login shells, interactive bash, zsh, systemd services, cron)
+
+            packages:
+              ubuntu: "auditd, apparmor, apparmor-utils, ufw, ripgrep, vim, tmux, curl, dnsutils, firewalld, tar, jq, needrestart, rsync, unzip, ca-certificates"
+              rhel: "auditd, ripgrep, vim-enhanced, tmux, rsync, zip, unzip, tar, jq, iproute, net-tools, traceroute, bind-utils, firewalld, chrony, policycoreutils-python-utils, setools-console, ca-certificates"
+
+            allowed_tcp_ports_rhel: ["22", "4450", "22300"]
+            allowed_tcp_ports_ubuntu: ["22", "443"]
+            firewall_udp_ports: ["123"] #ntp
+            firewalld_zone: public      # public zone typically allows inbound SSH and explicitly whitelisted services but denies everything else
+
+            selinux_state: "permissive"   # RHEL-family (enforcing|permissive|disabled) # Do NOT change to enforcing until you've reviewed: /var/log/audit.log
+            apparmor_state: "complain"  # Ubuntu (enforcing|complain|disabled) Every action that would be denied in enforce mode is logged as apparmor="DENIED" in /var/log/audit.log
+            reboot_when_required: false  # If true, role will reboot automatically when required; if false, it will warn that reboot is required to apply enforcing settings
+
+            unattended_auto_upgrade: false              # No auto upgrade
+            unattended_auto_update_security: true       # roles/os_settings/tasks/auto-update_rhel_ubuntu_security.yml
+            automatic_restart: false                    # roles/os_settings/tasks/automatic_restart.yml
+            security_update_calendar: '*-*-15 18:00:00'
+
+            rdp_service: xrdp
+            rdp_timer_pause:  "*-*-* 00:00:00" #systemctl stop xrdp.service
+            rdp_timer_start: "*-*-* 06:00:00" #systemctl start xrdp.service
+
+            sshd_config_path: /etc/ssh/sshd_config #roles/os_settings/templates/sshd_config.j2
+
+            sysctl_file: /etc/sysctl.d/99-hardening.conf
+            sysctl_params:
+              net.ipv4.conf.all.rp_filter: 1            # drop spoofed source ips
+              net.ipv4.tcp_syncookies: 1                # mitigate syn floods
+              net.ipv4.conf.all.accept_redirects: 0     # ignore icmp redirects (v4)
+              net.ipv6.conf.all.accept_redirects: 0     # ignore icmp redirects (v6)
+              kernel.kptr_restrict: 2                   # hide kernel pointers
+              kernel.dmesg_restrict: 1                  # restrict dmesg to root
+
+            timesync_enabled: true                      # Enable OS-level NTP client
+            timesync_ntp_servers:                        # list of NTP servers or pools to sync time from
+              - 0.europe.pool.ntp.org
+              - 1.europe.pool.ntp.org
+              - 2.europe.pool.ntp.org
+              - 3.europe.pool.ntp.org
+
+            fail2ban: true
+            jail_path: /etc/fail2ban/jail.local
+            backend: systemd                     # journald for backend
+            bantime: "1h"
+            findtime: "10m"                      # Count retries
+            maxretry: 5                          # Retries before a ban
+            ignoreip:
+              - "127.0.0.1/8" # CIDRs
+              - "::1"
+
+    - name: cache
+      tags: cache_settings
+      block:
+        - include_role:
+            name: cache_settings
+          vars:
+            # Journald configuration (logging limits)
+            journald_dropin_file: /etc/systemd/journald.conf.d/99-logging-limits.conf
+            journald_params:
+              SyncIntervalSec: 5m          # How often to flush in-memory journal to disk
+              RateLimitIntervalSec: 30s    # Time window for rate limiting bursts
+              RateLimitBurst: 2000         # Max number of messages allowed per interval
+              SystemMaxUse: 500M           # Total persistent on-disk journal size limit
+              SystemMaxFileSize: 50M       # Max size per persistent journal file
+              RuntimeMaxUse: 250M          # Total volatile (tmpfs) journal size limit
+              RuntimeMaxFileSize: 50M      # Max size per volatile (runtime) journal file
+              SystemKeepFree: "5%"         # Always leave 5% disk space free
+              RuntimeKeepFree: "5%"        # Keep 5% free in /run
+              MaxRetentionSec: 14day       # Time-based retention cap
+            tmpfiles_policy_path: /etc/tmpfiles.d/cache-prune.conf  # tmpfiles rules file
+            dnf_cache_retention: "7d"        # max age for DNF cache
+            man_cache_retention: "30d"       # max age for man-db cache
+            tmp_retention: "7d"              # purge /tmp older than this
+            var_tmp_retention: "14d"         # purge /var/tmp older than this
+            tmpfiles_clean_on_first_run: true  # run one-time clean now
+            coredump_conf_file: /etc/systemd/coredump.conf   # Where to write the coredump configuration
+            coredump_params:
+              Storage: none            # none|external|journal|both — "none" disables persistent core dumps
+              ProcessSizeMax: 0        # 0 = block all core files; set to a size (e.g. 2G) to allow limited dumps
+              Compress: yes          # compress stored core dumps
+              ExternalSizeMax: 2G    # maximum size of each core dump file
+              JournalSizeMax: 767M   # limit total size of journal-stored core dumps
+              MaxUse: 0              # total global quota for all cores (0 = unlimited)
+              KeepFree: 700            # minimum free disk space to leave on the filesystem

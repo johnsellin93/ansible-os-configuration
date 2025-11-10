@@ -1,0 +1,64 @@
+- name: Install EPEL release
+  package:
+    name: epel-release
+    state: present
+  when: ansible_facts.os_family == "RedHat"
+
+# (For RHEL 9) enable CRB if you haven’t already elsewhere
+- name: Enable CRB
+  command: dnf config-manager --set-enabled crb
+  changed_when: "'enabled' in (enable_crb.stdout | default('')) or 'enabled' in (enable_crb.stderr | default(''))"
+  register: enable_crb
+  failed_when: false
+  when: ansible_facts.os_family == "RedHat"
+
+
+
+- name: Build package list from vars (Ubuntu/Debian)
+  set_fact:
+    os_pkg_list: >-
+      {{ (packages.ubuntu | default('') )
+         | split(',')
+         | map('trim')
+         | reject('equalto','')
+         | list }}
+  when: ansible_facts.os_family == "Debian"
+
+- name: Build package list from vars (RHEL/Rocky/Alma)
+  set_fact:
+    os_pkg_list: >-
+      {{ (packages.rhel | default('') )
+         | split(',')
+         | map('trim')
+         | reject('equalto','')
+         | list }}
+  when: ansible_facts.os_family == "RedHat"
+
+- name: Refresh apt cache (Ubuntu/Debian)
+  apt:
+    update_cache: yes
+    cache_valid_time: 3600
+  when: ansible_facts.os_family == "Debian"
+
+- name: Install baseline packages
+  package:
+    name: "{{ os_pkg_list }}"
+    state: present
+  when: os_pkg_list | length > 0
+
+# Optional quality-of-life: ensure firewalld/chrony started if installed
+- name: Ensure firewalld running if installed
+  systemd:
+    name: firewalld
+    state: started
+    enabled: true
+  when:
+    - "'firewalld' in os_pkg_list"
+
+- name: Ensure chrony running if installed
+  systemd:
+    name: "{{ 'chronyd' if ansible_facts.os_family == 'RedHat' else 'chrony' }}"
+    state: started
+    enabled: true
+  when:
+    - "'chrony' in os_pkg_list"

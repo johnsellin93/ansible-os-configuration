@@ -1,0 +1,79 @@
+# Require: gather_facts: true in the play
+# Works for Linux/Unix and Windows. Non-destructive.
+
+- name: OS & kernel summary (all)
+  ansible.builtin.debug:
+    msg:
+      - "Host:   {{ inventory_hostname }}"
+      - "Family: {{ ansible_facts.os_family | default('unknown') }}"
+      - "OS:     {{ ansible_facts.distribution | default(ansible_facts.os_name | default('unknown')) }} {{ ansible_facts.distribution_version | default(ansible_facts.os_version | default('')) }}"
+      - "Kernel: {{ ansible_facts.kernel | default(ansible_facts.uname.release | default(ansible_facts.os_version | default('unknown'))) }}"
+      - "Arch:   {{ ansible_facts.architecture | default(ansible_facts.machine | default(ansible_facts.processor_architecture | default('unknown'))) }}"
+      - "Uptime: {{ ansible_facts.uptime | default((ansible_facts.uptime_seconds | default(0)) | int ~ 's') }}"
+
+# -------- Linux/Unix-only extras --------
+- name: Read /etc/os-release (generic)
+  when: ansible_facts.os_family != 'Windows'
+  ansible.builtin.slurp:
+    path: /etc/os-release
+  register: osr
+  failed_when: false
+  changed_when: false
+
+- name: Read /etc/redhat-release (RHEL/OL/CentOS-ish)
+  when: ansible_facts.os_family != 'Windows'
+  ansible.builtin.slurp:
+    path: /etc/redhat-release
+  register: rhr
+  failed_when: false
+  changed_when: false
+
+- name: Read /etc/lsb-release (Ubuntu/Debian variants)
+  when: ansible_facts.os_family != 'Windows'
+  ansible.builtin.slurp:
+    path: /etc/lsb-release
+  register: lsbr
+  failed_when: false
+  changed_when: false
+
+- name: Print Linux release file (first one that exists)
+  when: ansible_facts.os_family != 'Windows'
+  ansible.builtin.debug:
+    msg: >-
+      {{
+        (rhr.content | default('') | b64decode | trim)
+        | default(lsbr.content | default('') | b64decode | trim)
+        | default(osr.content  | default('') | b64decode | trim)
+        | default('(no *release file readable)')
+      }}
+
+# Optional: uname -a (Linux/Unix)
+- name: uname -a
+  when: ansible_facts.os_family != 'Windows'
+  ansible.builtin.command: uname -a
+  register: uname_raw
+  changed_when: false
+  failed_when: false
+
+- name: Show uname -a
+  when: ansible_facts.os_family != 'Windows'
+  ansible.builtin.debug:
+    msg: "{{ uname_raw.stdout | default('n/a') }}"
+
+# -------- Windows-only extras --------
+# Note: requires proper WinRM inventory vars (ansible_connection=winrm, etc.)
+- name: Windows detailed OS info (Caption/Version/Build/Arch)
+  when: ansible_facts.os_family == 'Windows'
+  ansible.windows.win_shell: |
+    Get-CimInstance Win32_OperatingSystem |
+      Select-Object Caption, Version, BuildNumber, OSArchitecture |
+      ConvertTo-Json -Compress
+  register: win_os_json
+  changed_when: false
+  failed_when: false
+
+- name: Show Windows OS info
+  when: ansible_facts.os_family == 'Windows'
+  ansible.builtin.debug:
+    msg: >-
+      {{ (win_os_json.stdout | default('{}')) }}

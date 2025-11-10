@@ -1,0 +1,31 @@
+---
+- name: restart fail2ban
+  service:
+    name: fail2ban
+    state: restarted
+    enabled: yes
+
+- name: apply sysctl (systemd)
+  when: ansible_service_mgr == 'systemd'
+  systemd:
+    name: systemd-sysctl
+    state: restarted
+
+- name: systemd daemon-reload
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: restart chrony
+  systemd:
+    name: "{{ 'chrony' if ansible_os_family == 'Debian' else 'chronyd' }}"
+    state: restarted
+
+- name: reload ssh
+  ansible.builtin.systemd:
+    name: "{{ (ansible_os_family == 'RedHat') | ternary('sshd','ssh') }}"
+    state: reloaded
+
+
+- name: update-grub
+  ansible.builtin.command: update-grub
+  listen: update-grub

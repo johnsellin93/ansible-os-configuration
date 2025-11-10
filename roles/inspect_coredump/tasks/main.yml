@@ -1,0 +1,117 @@
+- name: Display systemd coredump config
+  vars:
+    coredump_main_etc: /etc/systemd/coredump.conf
+    coredump_main_lib: /usr/lib/systemd/coredump.conf
+    coredump_dir:      /etc/systemd/coredump.conf.d
+  block:
+    # --- Pick main file (/etc preferred, else /usr/lib) ---
+    - name: Check for main coredump.conf locations
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ coredump_main_etc }}"
+        - "{{ coredump_main_lib }}"
+      register: main_stats
+      changed_when: false
+
+    - name: Decide which coredump.conf to read
+      ansible.builtin.set_fact:
+        coredump_main: >-
+          {{
+            (main_stats.results[0].stat.exists | default(false)) | ternary(
+              coredump_main_etc,
+              (main_stats.results[1].stat.exists | default(false)) | ternary(
+                coredump_main_lib, ''
+              )
+            )
+          }}
+
+    - name: Fail if no coredump.conf found
+      ansible.builtin.fail:
+        msg: "Neither {{ coredump_main_etc }} nor {{ coredump_main_lib }} found."
+      when: coredump_main == ''
+
+    - name: Read {{ coredump_main }}
+      ansible.builtin.slurp:
+        path: "{{ coredump_main }}"
+      register: main_raw
+      changed_when: false
+
+    - name: Decode main config text
+      ansible.builtin.set_fact:
+        main_text: "{{ main_raw.content | b64decode }}"
+
+    # --- Show ALL explicit settings in the main file ---
+    - name: List all key=value settings in {{ coredump_main }}
+      vars:
+        re_kv: '(?m)^\s*([^\s#;\[\]][^=\s]*)\s*=\s*(.*?)\s*$'
+        kv_pairs: "{{ main_text | regex_findall(re_kv) | list }}"
+      ansible.builtin.debug:
+        msg:
+          - "---- Explicit settings in {{ coredump_main }} ----"
+          - >-
+            {{ kv_pairs | map('join', '=') | list | default(['(no explicit settings found)']) }}
+
+    - name: Print {{ coredump_main }} (line by line)
+      ansible.builtin.debug:
+        msg: "{{ main_text.splitlines() }}"
+
+    # --- Drop-in directory (optional) ---
+    - name: Check for {{ coredump_dir }}
+      ansible.builtin.stat:
+        path: "{{ coredump_dir }}"
+      register: dir_stat
+      changed_when: false
+
+    - name: Find drop-in files in {{ coredump_dir }}
+      when: dir_stat.stat.isdir | default(false)
+      ansible.builtin.find:
+        paths: "{{ coredump_dir }}"
+        patterns: "*.conf"
+        file_type: file
+        recurse: no
+      register: dropins
+
+
+    - name: Read each drop-in file
+      when: (dropins.files | default([])) | length > 0
+      ansible.builtin.slurp:
+        path: "{{ item.path }}"
+      loop: "{{ dropins.files | default([]) }}"
+      loop_control:
+        label: "{{ item.path }}"
+      register: dropin_raws
+      changed_when: false
+
+
+    - name: Parse each drop-in for ALL key=value
+      when:
+        - dropin_raws is defined
+        - (dropin_raws.results | default([])) | length > 0
+      vars:
+        re_kv: '(?m)^\s*([^\s#;\[\]][^=\s]*)\s*=\s*(.*?)\s*$'
+        text: "{{ item.content | b64decode }}"
+        kv_pairs: "{{ text | regex_findall(re_kv) | list }}"
+      ansible.builtin.debug:
+        msg:
+          - "---- {{ item.source | default('drop-in (unknown path)') }} ----"
+          - "{{ (kv_pairs | map('join','=') | list) | default(['(no explicit settings found)']) }}"
+      loop: "{{ dropin_raws.results }}"
+      loop_control:
+        label: "{{ item.source | default('(unknown file)') }}"
+
+
+    - name: Print each drop-in file (line by line)
+      when:
+        - dropin_raws is defined
+        - (dropin_raws.results | default([])) | length > 0
+      ansible.builtin.debug:
+        msg: >-
+          {{
+            ['----- ' ~ (item.source | default('')) ~ ' -----']
+            + ((item.content | default('') | b64decode).splitlines())
+          }}
+      loop: "{{ dropin_raws.results }}"
+      loop_control:
+        label: "{{ item.source | default('(unknown file)') }}"
+

@@ -1,0 +1,22 @@
+---
+# These names in `listen:` must match your `notify:` strings
+
+- name: daemon-reload systemd
+  listen: reload systemd daemon
+  become: true
+  ansible.builtin.systemd:
+    daemon_reload: true
+  changed_when: false
+
+- name: dnf clean all
+  listen: dnf clean
+  become: true
+  ansible.builtin.command: dnf clean all
+  changed_when: true
+
+- name: restart journald
+  listen: restart systemd-journald
+  become: true
+  ansible.builtin.systemd:
+    name: systemd-journald
+    state: restarted

@@ -1,0 +1,138 @@
+# Expect:
+# automatic_restart: false   # disable auto reboots + service auto-restarts after updates
+
+- name: Gather package facts (used for optional guards)
+  package_facts:
+    manager: auto
+
+# --- Ubuntu / Debian: disable unattended-upgrades auto reboot + needrestart auto-restart ---
+- name: Disable auto reboot/service restarts on Ubuntu/Debian
+  when: ansible_facts.os_family == 'Debian' and (automatic_restart | default(false) | bool) == false
+  block:
+    - name: Ensure config dirs exist
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - /etc/apt/apt.conf.d
+        - /etc/needrestart
+
+    # 1) Unattended upgrades: block automatic reboot (create file if missing)
+    - name: Ensure Automatic-Reboot is false
+      lineinfile:
+        path: /etc/apt/apt.conf.d/50unattended-upgrades
+        regexp: '^\s*Unattended-Upgrade::Automatic-Reboot\s*'
+        line: 'Unattended-Upgrade::Automatic-Reboot "false";'
+        create: yes
+        mode: '0644'
+
+    # (optional) also be explicit about reboot-with-users
+    - name: Ensure Automatic-Reboot-WithUsers is false
+      lineinfile:
+        path: /etc/apt/apt.conf.d/50unattended-upgrades
+        regexp: '^\s*Unattended-Upgrade::Automatic-Reboot-WithUsers\s*'
+        line: 'Unattended-Upgrade::Automatic-Reboot-WithUsers "false";'
+        create: yes
+        mode: '0644'
+
+    # 2) needrestart: do NOT auto-restart services post-upgrade (list-only)
+    # Guard: only write if needrestart is installed OR we're okay dropping the config anyway.
+    - name: Configure needrestart to not auto-restart (list-only)
+      lineinfile:
+        path: /etc/needrestart/needrestart.conf
+        regexp: '^\s*\$nrconf{restart}\s*='
+        line: "$nrconf{restart} = 'l';"   # 'l' = list only; 'a' = auto; 'i' = interactive
+        create: yes
+        mode: '0644'
+      when: "'needrestart' in ansible_facts.packages or True"  # keep as True to create config harmlessly
+
+    - name: Debian/Ubuntu | Disable unattended automation completely
+      when:
+        - ansible_facts.os_family == 'Debian'
+      block:
+        - name: Disable auto updates and unattended-upgrades
+          copy:
+            dest: /etc/apt/apt.conf.d/20auto-upgrades
+            mode: '0644'
+            content: |
+              APT::Periodic::Update-Package-Lists "0";
+              APT::Periodic::Unattended-Upgrade "0";
+
+        - name: Stop/disable apt daily timers (tolerant if missing)
+          systemd:
+            name: "{{ item }}"
+            state: stopped
+            enabled: false
+            masked: true
+          loop:
+            - apt-daily.timer
+            - apt-daily-upgrade.timer
+            - apt-daily.service
+            - apt-daily-upgrade.service
+          failed_when: false
+
+
+# --- RHEL / Rocky / Alma / Oracle Linux 9: disable dnf-automatic + reboots ---
+- name: Disable auto updates/reboots on RHEL family
+  when: ansible_facts.os_family == 'RedHat' and (automatic_restart | default(false) | bool) == false
+  block:
+    - name: Ensure dnf config dir exists
+      file:
+        path: /etc/dnf
+        state: directory
+        mode: "0755"
+
+    # 1) Make /etc/dnf/automatic.conf explicitly NOT apply or download updates (and no reboots)
+    - name: Ensure dnf-automatic.conf disables auto actions
+      ini_file:
+        path: /etc/dnf/automatic.conf
+        section: commands
+        option: "{{ item.option }}"
+        value: "{{ item.value }}"
+        create: yes
+        mode: '0644'
+      loop:
+        - { option: upgrade_type,      value: default } #no upgrade since dnf automatic timer is stopped and disabled
+        - { option: random_sleep,      value: "0" }
+        - { option: download_updates,  value: "no" }
+        - { option: apply_updates,     value: "no" }
+        - { option: reboot,            value: "never" }
+      loop_control:
+        label: "{{ item.option }}"
+
+    # 2) Stop, disable, and mask ALL dnf-automatic timers and services if present
+    - name: Disable dnf-automatic timers/services (if present)
+      systemd:
+        name: "{{ item }}"
+        state: stopped
+        enabled: false
+        masked: true
+      loop:
+        - dnf-automatic.timer
+        - dnf-automatic-install.timer
+        - dnf-automatic-notifyonly.timer
+        - dnf-automatic-download.timer
+        - dnf-automatic.service
+        - dnf-automatic-install.service
+        - dnf-automatic-notifyonly.service
+        - dnf-automatic-download.service
+      failed_when: false
+
+    # 4) (optional) also disable packagekit (if present), which can auto-download/apply updates
+    - name: disable packagekit services if present
+      systemd:
+        name: "{{ item }}"
+        state: stopped
+        enabled: false
+        masked: true
+      loop:
+        - packagekit.service
+        - packagekit-offline-update.service
+      failed_when: false
+
+    - name: Remove dnf-automatic package if installed
+      package:
+        name: dnf-automatic
+        state: absent
+      when: "'dnf-automatic' in (ansible_facts.packages | default({}))"

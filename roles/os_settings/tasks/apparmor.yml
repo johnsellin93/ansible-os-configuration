@@ -1,0 +1,121 @@
+---
+# Install and start AppArmor when enabled
+- name: Ensure AppArmor packages are present
+  ansible.builtin.package:
+    name:
+      - apparmor
+      - apparmor-utils
+    state: present
+  when: apparmor_state != "disabled"
+
+- name: Ensure AppArmor service enabled/started
+  ansible.builtin.service:
+    name: apparmor
+    enabled: true
+    state: started
+  when: apparmor_state != "disabled"
+
+# ----- GRUB kernel params (idempotent, no duplicates) -----
+# Ensure the key exists
+- name: Ensure GRUB_CMDLINE_LINUX exists
+  ansible.builtin.lineinfile:
+    path: /etc/default/grub
+    regexp: '^GRUB_CMDLINE_LINUX='
+    line: 'GRUB_CMDLINE_LINUX=""'
+    create: yes
+    backup: yes
+  when: apparmor_state != "disabled"
+
+# Read current line
+- name: Read GRUB_CMDLINE_LINUX
+  ansible.builtin.shell: >
+    set -o pipefail &&
+    grep -E '^GRUB_CMDLINE_LINUX=' /etc/default/grub
+    | sed -E 's/^GRUB_CMDLINE_LINUX="(.*)"/\1/'
+  args:
+    executable: /bin/bash
+  register: grub_cmdline
+  changed_when: false
+  when: apparmor_state != "disabled"
+
+# Compute unique args
+- name: Build unique kernel cmdline (no duplicates)
+  ansible.builtin.set_fact:
+    apparmor_kernel_args: "{{ (grub_cmdline.stdout.split() + ['apparmor=1','security=apparmor']) | unique }}"
+  when: apparmor_state != "disabled"
+
+# Write back only if changed
+- name: Ensure GRUB has AppArmor kernel params (idempotent)
+  ansible.builtin.lineinfile:
+    path: /etc/default/grub
+    regexp: '^GRUB_CMDLINE_LINUX='
+    line: 'GRUB_CMDLINE_LINUX="{{ apparmor_kernel_args | join(" ") }}"'
+    backup: yes
+  register: grub_edit
+  when: apparmor_state != "disabled"
+  notify: update-grub
+
+# ----- AppArmor mode management -----
+# Put ALL profiles into enforce
+- name: Put all AppArmor profiles into enforce mode
+  ansible.builtin.shell: |
+    set -euo pipefail
+    shopt -s nullglob
+    aa-enforce /etc/apparmor.d/*
+  args:
+    executable: /bin/bash
+  register: aa_enforce_result
+  changed_when: false
+  when:
+    - apparmor_state == "enforcing"
+
+# Put ALL profiles into complain
+- name: Put all AppArmor profiles into complain mode
+  ansible.builtin.shell: |
+    set -euo pipefail
+    shopt -s nullglob
+    aa-complain /etc/apparmor.d/*
+  args:
+    executable: /bin/bash
+  register: aa_complain_result
+  changed_when: false
+  when:
+    - apparmor_state == "complain"
+
+- name: Reload AppArmor to (re)parse profiles
+  ansible.builtin.service:
+    name: apparmor
+    state: reloaded
+  when: apparmor_state in ["enforcing", "complain"]
+
+
+
+# Disable completely (service stopped/disabled). Kernel params left untouched for safety.
+- name: Stop and disable AppArmor
+  ansible.builtin.service:
+    name: apparmor
+    enabled: false
+    state: stopped
+  when: apparmor_state == "disabled"
+
+# ----- Reboot flow (flag + optional reboot) -----
+- name: Mark reboot required for AppArmor kernel params
+  ansible.builtin.set_fact:
+    os_settings_reboot_required: true
+    os_settings_reboot_reasons: >-
+      {{ (os_settings_reboot_reasons | default([]))
+         + ['AppArmor kernel parameters updated (GRUB)'] }}
+  when: grub_edit is changed
+
+- name: Reboot now to activate AppArmor kernel parameters (optional)
+  ansible.builtin.reboot:
+    msg: "Rebooting to activate AppArmor kernel parameters"
+    connect_timeout: 60
+    reboot_timeout: 1200
+    pre_reboot_delay: 0
+    post_reboot_delay: 30
+    test_command: "aa-status"
+  when:
+    - grub_edit is changed
+    - reboot_when_required | default(false)
+  tags: [reboot]

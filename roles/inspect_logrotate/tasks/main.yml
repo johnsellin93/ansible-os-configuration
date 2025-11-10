@@ -1,0 +1,84 @@
+---
+- name: Display logrotate config
+  vars:
+    logrotate_main: /etc/logrotate.conf
+    logrotate_dir:  /etc/logrotate.d
+  block:
+    - name: Check for {{ logrotate_main }}
+      ansible.builtin.stat:
+        path: "{{ logrotate_main }}"
+      register: main_stat
+      changed_when: false
+
+    - name: Fail if {{ logrotate_main }} does not exist
+      ansible.builtin.fail:
+        msg: "{{ logrotate_main }} not found on this host."
+      when: not main_stat.stat.exists
+
+    - name: Read {{ logrotate_main }}
+      ansible.builtin.slurp:
+        path: "{{ logrotate_main }}"
+      register: main_raw
+      changed_when: false
+
+    - name: Decode main config text
+      ansible.builtin.set_fact:
+        main_text: "{{ main_raw.content | b64decode }}"
+
+    # --- Quick summary of common settings in the main file ---
+    - name: Summarize common settings
+      vars:
+        re_period:   '(?im)^\s*(daily|weekly|monthly|yearly)\s*$'
+        re_rotate:   '(?im)^\s*rotate\s+(\d+)\s*$'
+        re_compress: '(?im)^\s*compress\s*$'
+        re_dateext:  '(?im)^\s*dateext\s*$'
+        re_su:       '(?im)^\s*su\s+(\S+)\s+(\S+)\s*$'
+      ansible.builtin.debug:
+        msg:
+          - "File: {{ logrotate_main }}"
+          - "period: {{ (main_text | regex_search(re_period, '\\1')) | default('not set') }}"
+          - "rotate: {{ (main_text | regex_search(re_rotate, '\\1')) | default('not set') }}"
+          - "compress: {{ 'yes' if (main_text is regex(re_compress)) else 'no' }}"
+          - "dateext: {{ 'yes' if (main_text is regex(re_dateext)) else 'no' }}"
+          - "su: {{ (main_text | regex_replace(re_su, '\\1:\\2')) | default('not set') }}"
+
+    - name: Print {{ logrotate_main }} (line by line)
+      ansible.builtin.debug:
+        msg: "{{ main_text.splitlines() }}"
+
+    # --- Drop-in directory ---
+    - name: Check for {{ logrotate_dir }}
+      ansible.builtin.stat:
+        path: "{{ logrotate_dir }}"
+      register: dir_stat
+      changed_when: false
+
+    - name: Find drop-in files in {{ logrotate_dir }}
+      when: dir_stat.stat.isdir | default(false)
+      ansible.builtin.find:
+        paths: "{{ logrotate_dir }}"
+        file_type: file
+        recurse: no
+      register: dropins
+
+    - name: Read each drop-in file
+      when: dropins.files | length > 0
+      ansible.builtin.slurp:
+        path: "{{ item.path }}"
+      loop: "{{ dropins.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+      register: dropin_raws
+      changed_when: false
+
+    - name: Print each drop-in (line by line)
+      when: dropin_raws is defined
+      ansible.builtin.debug:
+        msg: >-
+          {{
+            ['----- ' ~ (item.source | default('')) ~ ' -----']
+            + ((item.content | default('') | b64decode).splitlines())
+          }}
+      loop: "{{ dropin_raws.results }}"
+      loop_control:
+        label: "{{ item.source | default('(unknown file)') }}"

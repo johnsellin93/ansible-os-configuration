@@ -1,0 +1,15 @@
+# Managed by Ansible
+[Unit]
+Description=Gracefully stop Oracle Base before system shutdown/reboot
+DefaultDependencies=no
+Before=shutdown.target reboot.target halt.target poweroff.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/true
+ExecStop=/bin/systemctl stop {{ oracle_base_service_name }}
+RemainAfterExit=yes
+TimeoutStopSec=5min
+
+[Install]
+WantedBy=multi-user.target

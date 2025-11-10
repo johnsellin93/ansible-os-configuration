@@ -1,0 +1,189 @@
+# --- RedHat repo enablement FIRST ---
+- name: Prepare CRB / CodeReady on RedHat family
+  when: ansible_facts.os_family == 'RedHat'
+  block:
+    - name: Ensure dnf-plugins-core is present (for config-manager)
+      package:
+        name: dnf-plugins-core
+        state: present
+
+    - name: Enable CRB (RHEL9/Rocky/Alma)
+      command: dnf config-manager --set-enabled crb
+      register: enable_crb
+      changed_when: "'enabled' in (enable_crb.stdout | default('')) or 'enabled' in (enable_crb.stderr | default(''))"
+      failed_when: false
+
+    - name: Enable CodeReady (RHEL only)
+      command: subscription-manager repos --enable=codeready-builder-for-rhel-9-$(arch)-rpms
+      when: ansible_distribution == "RedHat"
+      register: enable_crb_rhel
+      changed_when: "'enabled' in (enable_crb_rhel.stdout | default('')) or 'enabled' in (enable_crb_rhel.stderr | default(''))"
+      failed_when: false
+
+
+- name: Update apt cache (Debian/Ubuntu)
+  when: ansible_facts.os_family == 'Debian'
+  apt:
+    update_cache: yes
+    cache_valid_time: 3600
+
+
+- name: Ensure build deps for CPython
+  package:
+    name: "{{ (ansible_facts.os_family == 'Debian') | ternary(
+            ['git','build-essential','zlib1g-dev','libssl-dev','libbz2-dev','libreadline-dev','libffi-dev','libsqlite3-dev','xz-utils','liblzma-dev','tk-dev','curl','ca-certificates','patch','findutils','debianutils','libgdbm-dev','libnss3-dev','libncursesw5-dev','uuid-dev'],
+            ['git','gcc','gcc-c++','make','zlib-devel','openssl-devel','bzip2','bzip2-devel','readline-devel','libffi-devel','sqlite','sqlite-devel','xz','xz-devel','tk','tk-devel','curl','ca-certificates','patch','findutils','which'])
+         }}"
+    state: present
+
+
+# --- pyenv install/update ---
+- name: Install/Update pyenv (idempotent)
+  git:
+    repo: https://github.com/pyenv/pyenv.git
+    dest: "{{ python_venv_dir }}"
+    version: master
+    update: yes
+  tags: pyenv
+
+- name: (Optional) Install pyenv-virtualenv plugin
+  git:
+    repo: https://github.com/pyenv/pyenv-virtualenv.git
+    dest: "{{ python_venv_dir }}/plugins/pyenv-virtualenv"
+    version: master
+    update: yes
+  tags: pyenv
+
+# --- Shell init for ALL users / login shells ---
+- name: System-wide pyenv init
+  copy:
+    dest: /etc/profile.d/pyenv.sh
+    mode: "0644"
+    content: |
+      export PYENV_ROOT="{{ python_venv_dir }}"
+      # Put shims first so "python3" hits pyenv
+      export PATH="$PYENV_ROOT/shims:$PYENV_ROOT/bin:$PATH"
+      eval "$(pyenv init -)"
+      if [ -d "$PYENV_ROOT/plugins/pyenv-virtualenv" ]; then
+        eval "$(pyenv virtualenv-init -)"
+      fi
+
+# --- Permissions when under /opt ---
+- name: Ensure pyenv tree is readable by all users (if under /opt)
+  file:
+    path: "{{ python_venv_dir }}"
+    recurse: yes
+    mode: "a+rX"
+  when: python_venv_dir is match('^/opt/')
+
+# --- Install requested Python & set global ---
+- name: Install Python {{ python_version }} via pyenv
+  command: "{{ python_venv_dir }}/bin/pyenv install -s {{ python_version }}"
+  environment:
+    PYENV_ROOT: "{{ python_venv_dir }}"
+    PATH: "{{ python_venv_dir }}/bin:{{ ansible_env.PATH }}"
+  args:
+    creates: "{{ python_venv_dir }}/versions/{{ python_version }}/bin/python3"
+
+- name: Read current global pyenv version
+  command: "{{ python_venv_dir }}/bin/pyenv global"
+  register: pyenv_global_out
+  changed_when: false
+  failed_when: false
+  environment:
+    PYENV_ROOT: "{{ python_venv_dir }}"
+    PATH: "{{ python_venv_dir }}/bin:{{ ansible_env.PATH }}"
+
+- name: Set pyenv global {{ python_version }}
+  command: "{{ python_venv_dir }}/bin/pyenv global {{ python_version }}"
+  when: env_global | bool and (pyenv_global_out.stdout | default('')) != python_version
+  environment:
+    PYENV_ROOT: "{{ python_venv_dir }}"
+    PATH: "{{ python_venv_dir }}/bin:{{ ansible_env.PATH }}"
+
+- name: Rehash shims
+  command: "{{ python_venv_dir }}/bin/pyenv rehash"
+  environment:
+    PYENV_ROOT: "{{ python_venv_dir }}"
+    PATH: "{{ python_venv_dir }}/bin:{{ ansible_env.PATH }}"
+
+
+
+# --- Interactive Bash (system-wide) ---
+- name: Ensure system-wide bashrc sources pyenv profile
+  lineinfile:
+    path: "{{ (ansible_facts.os_family == 'RedHat') | ternary('/etc/bashrc','/etc/bash.bashrc') }}"
+    create: yes
+    mode: "0644"
+    regexp: '^\[ -f /etc/profile\.d/pyenv\.sh \] && \. /etc/profile\.d/pyenv\.sh$'
+    line: '[ -f /etc/profile.d/pyenv.sh ] && . /etc/profile.d/pyenv.sh'
+    insertafter: EOF
+
+
+- name: Check if zsh is installed
+  ansible.builtin.stat:
+    path: /bin/zsh
+  register: zsh_bin
+
+- name: Check alternate zsh path
+  ansible.builtin.stat:
+    path: /usr/bin/zsh
+  register: zsh_usr_bin
+
+- block:
+    - name: Ensure /etc/zsh exists
+      ansible.builtin.file:
+        path: /etc/zsh
+        state: directory
+        mode: "0755"
+
+    - name: Ensure zsh logins source pyenv
+      ansible.builtin.copy:
+        dest: /etc/zsh/zprofile
+        mode: "0644"
+        content: |
+          [ -f /etc/profile.d/pyenv.sh ] && . /etc/profile.d/pyenv.sh
+  when: zsh_bin.stat.exists or zsh_usr_bin.stat.exists
+
+
+
+# --- Systemd (all services) ---
+- name: Ensure systemd manager drop-in dir exists
+  file:
+    path: /etc/systemd/system.conf.d
+    state: directory
+    mode: "0755"
+
+- name: Set global env for systemd (PYENV_ROOT + PATH)
+  copy:
+    dest: /etc/systemd/system.conf.d/pyenv.conf
+    mode: "0644"
+    content: |
+      [Manager]
+      DefaultEnvironment=PYENV_ROOT={{ python_venv_dir }}
+      DefaultEnvironment=PATH={{ python_venv_dir }}/shims:{{ python_venv_dir }}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+  notify: systemd daemon-reload
+
+# --- Cron (/etc/environment) ---
+- name: Ensure PYENV_ROOT in /etc/environment
+  lineinfile:
+    path: /etc/environment
+    regexp: '^PYENV_ROOT='
+    line: 'PYENV_ROOT="{{ python_venv_dir }}"'
+    create: yes
+
+- name: Ensure PATH in /etc/environment includes pyenv (prepend)
+  lineinfile:
+    path: /etc/environment
+    regexp: '^PATH='
+    line: 'PATH="{{ python_venv_dir }}/shims:{{ python_venv_dir }}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"'
+    create: yes
+
+# RHEL/Alma/Rocky: ensure cron actually loads /etc/environment via pam_env
+- name: Ensure pam_env is enabled for crond (RHEL family)
+  when: ansible_facts.os_family == 'RedHat'
+  lineinfile:
+    path: /etc/pam.d/crond
+    regexp: '^\s*session\s+required\s+pam_env\.so'
+    line: 'session    required   pam_env.so'
+    insertafter: '^#.*'

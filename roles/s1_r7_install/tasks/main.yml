@@ -1,0 +1,272 @@
+---
+# --- SentinelOne & Rapid7 role summary (banner) ------------------------------
+- name: Build SentinelOne & Rapid7 role summary banner
+  ansible.builtin.set_fact:
+    s1_r7_banner_msg:
+      - "SentinelOne & Rapid7 deployment:"
+      - "  • OS-aware: auto-pick DEB/RPM based on ansible_os_family."
+      - "  • Rapid7: skipped on OracleLinux with UEK kernel (unsupported combo)."
+      - "Rapid7 agent flow:"
+      - "  • Stage installer to /var/tmp from role files."
+      - "  • Install via {{ ansible_os_family == 'Debian' | ternary('apt','dnf') }} using the staged package."
+      - "  • If agent UUID missing: run configure_agent.sh with provided token (--start)."
+      - "  • Enable & start ir_agent.service (non-fatal on failure)."
+      - "  • Remove staged installer after install."
+      - "SentinelOne agent flow:"
+      - "  • Stage installer to /var/tmp from role files."
+      - "  • Install via apt/dnf using the staged package."
+      - "  • Set management token via sentinelctl; start via CLI and systemd unit."
+      - "  • Enable sentinelone.service when present; ignore failures safely."
+      - "Post-checks:"
+      - "  • Summary prints Rapid7 support + return codes for configure/token steps."
+      - "  • Show systemctl status for sentinelone.service and ir_agent.service."
+      - "Safety/assumptions:"
+      - "  • Requires valid rapid7_token and sentinelone_site_token provided externally."
+      - "  • No automatic uninstall; idempotent on rerun (skips when already enrolled where possible)."
+
+- name: Show SentinelOne & Rapid7 role summary
+  ansible.builtin.debug:
+    var: s1_r7_banner_msg
+
+
+
+- name: Install SentinelOne & Rapid7 (auto-pick DEB/RPM per OS)
+  block:
+
+    # ---------------------------------------------------------------------
+    # Pre-flight
+    # ---------------------------------------------------------------------
+    - name: Ensure rsync is present (for other roles/tools if needed)
+      become: true
+      ansible.builtin.package:
+        name: rsync
+        state: present
+
+    - name: Ensure /var/tmp exists
+      become: true
+      ansible.builtin.file:
+        path: /var/tmp
+        state: directory
+        mode: "0755"
+
+    # Skip Rapid7 if Oracle Linux + UEK kernel (common constraint)
+    - name: Set rapid7_supported (skip on Oracle+UEK)
+      ansible.builtin.set_fact:
+        rapid7_supported: >-
+          {{
+            not (ansible_distribution == "OracleLinux"
+                and ('uek' in (ansible_kernel | lower)))
+          }}
+
+    - name: Note when Rapid7 is being skipped (Oracle+UEK)
+      ansible.builtin.debug:
+        msg: "Skipping Rapid7: Oracle Linux with UEK detected (Rapid7 not supported on UEK)."
+      when: not rapid7_supported
+
+    # ---------------------------------------------------------------------
+    # Choose the correct package files from roles/.../files/ (private vars)
+    # ---------------------------------------------------------------------
+    - name: Select per-OS package sources (private vars)
+      ansible.builtin.set_fact:
+        _r7_pkg_src: "{{ 'rapid7-insight-agent_4.0.13.32-1_amd64.deb' if ansible_os_family == 'Debian'
+                        else 'rapid7-insight-agent-4.0.13.32-1.x86_64.rpm' }}"
+        _s1_pkg_src: "{{ 'SentinelAgent_linux_x86_64_v24_3_1_29.deb' if ansible_os_family == 'Debian'
+                        else 'SentinelAgent_linux_x86_64_v24_3_1_29.rpm' }}"
+        _r7_pkg_type: "{{ 'deb' if ansible_os_family == 'Debian' else 'rpm' }}"
+        _s1_pkg_type: "{{ 'deb' if ansible_os_family == 'Debian' else 'rpm' }}"
+
+    - name: Assert chosen packages match OS family (fail fast)
+      ansible.builtin.assert:
+        that:
+          - (ansible_os_family == 'Debian' and (_r7_pkg_src | regex_search('\.deb$')) and (_s1_pkg_src | regex_search('\.deb$'))) or
+            (ansible_os_family == 'RedHat' and (_r7_pkg_src | regex_search('\.rpm$')) and (_s1_pkg_src | regex_search('\.rpm$')))
+        fail_msg: "Chosen package(s) do not match OS family {{ ansible_os_family }}: r7={{ _r7_pkg_src }}, s1={{ _s1_pkg_src }}"
+
+    - name: Compute staged file paths
+      ansible.builtin.set_fact:
+        _r7_staged: "/var/tmp/{{ _r7_pkg_src }}"
+        _s1_staged: "/var/tmp/{{ _s1_pkg_src }}"
+
+    # ---------------------------------------------------------------------
+    # Rapid7 — stage, install, configure, service, cleanup
+    # ---------------------------------------------------------------------
+    - name: Stage Rapid7 package to /var/tmp
+      become: true
+      ansible.builtin.copy:
+        src: "{{ _r7_pkg_src }}"     # looked up under roles/s1_r7_install/files/
+        dest: "{{ _r7_staged }}"
+        mode: "0644"
+      when: rapid7_supported
+
+    - name: Install Rapid7 (RPM)
+      become: true
+      ansible.builtin.dnf:
+        name: "{{ _r7_staged }}"
+        state: present
+      notify: daemon-reload
+      when:
+        - rapid7_supported
+        - _r7_pkg_type == 'rpm'
+        - ansible_os_family == 'RedHat'
+
+    - name: Install Rapid7 (DEB)
+      become: true
+      ansible.builtin.apt:
+        deb: "{{ _r7_staged }}"
+        state: present
+      notify: daemon-reload
+      when:
+        - rapid7_supported
+        - _r7_pkg_type == 'deb'
+        - ansible_os_family == 'Debian'
+
+    - name: Rapid7 | skip configure if UUID already present
+      ansible.builtin.stat:
+        path: /etc/rapid7/ir_agent/agent.uuid
+      register: r7_uuid
+      when: rapid7_supported
+
+    - name: Rapid7 | locate configure_agent.sh
+      ansible.builtin.stat:
+        path: /opt/rapid7/ir_agent/components/insight_agent/configure_agent.sh
+      register: r7_cfg_script
+      when: rapid7_supported
+
+    - name: Rapid7 | Ensure configure_agent.sh is executable
+      become: true
+      ansible.builtin.file:
+        path: /opt/rapid7/ir_agent/components/insight_agent/configure_agent.sh
+        mode: "0755"
+      when:
+        - rapid7_supported
+        - not (r7_uuid.stat.exists | default(false))
+        - r7_cfg_script.stat.exists | default(false)
+
+    - name: Rapid7 configure token (only when not enrolled)
+      become: true
+      no_log: true
+      ansible.builtin.command: ./configure_agent.sh --token={{ rapid7_token }} --start
+      args:
+        chdir: /opt/rapid7/ir_agent/components/insight_agent
+      register: r7_configure
+      changed_when: r7_configure.rc == 0
+      when:
+        - rapid7_supported
+        - not (r7_uuid.stat.exists | default(false))
+        - r7_cfg_script.stat.exists | default(false)
+
+    - name: Rapid7 | Start and enable ir_agent.service
+      become: true
+      ansible.builtin.systemd:
+        name: ir_agent.service
+        state: started
+        enabled: true
+      failed_when: false
+      when: rapid7_supported
+
+    - name: Rapid7 | Remove staged package
+      become: true
+      ansible.builtin.file:
+        path: "{{ _r7_staged }}"
+        state: absent
+      when: rapid7_supported
+
+    # ---------------------------------------------------------------------
+    # SentinelOne — stage, install, token/start, service, cleanup
+    # ---------------------------------------------------------------------
+    - name: Stage SentinelOne package to /var/tmp
+      become: true
+      ansible.builtin.copy:
+        src: "{{ _s1_pkg_src }}"     # looked up under roles/s1_r7_install/files/
+        dest: "{{ _s1_staged }}"
+        mode: "0644"
+
+    - name: Install SentinelOne (RPM)
+      become: true
+      ansible.builtin.dnf:
+        name: "{{ _s1_staged }}"
+        state: present
+      notify: daemon-reload
+      when:
+        - _s1_pkg_type == 'rpm'
+        - ansible_os_family == 'RedHat'
+
+    - name: Install SentinelOne (DEB)
+      become: true
+      ansible.builtin.apt:
+        deb: "{{ _s1_staged }}"
+        state: present
+      notify: daemon-reload
+      when:
+        - _s1_pkg_type == 'deb'
+        - ansible_os_family == 'Debian'
+
+    - name: SentinelOne configure token
+      become: true
+      no_log: true
+      ansible.builtin.command: "sentinelctl management token set {{ sentinelone_site_token }}"
+      args:
+        chdir: /opt/sentinelone/bin
+      register: s1_token_set
+      changed_when: s1_token_set.rc == 0
+      failed_when: false
+
+    - name: SentinelOne start agent via CLI
+      become: true
+      ansible.builtin.command: ./sentinelctl control start
+      args:
+        chdir: /opt/sentinelone/bin
+      register: s1_start_cli
+      changed_when: s1_start_cli.rc == 0
+      failed_when: false
+
+    - name: SentinelOne | Enable and start systemd unit (if present)
+      become: true
+      ansible.builtin.systemd:
+        name: sentinelone.service
+        state: started
+        enabled: true
+      failed_when: false
+
+    - name: SentinelOne | Remove staged package
+      become: true
+      ansible.builtin.file:
+        path: "{{ _s1_staged }}"
+        state: absent
+
+    # ---------------------------------------------------------------------
+    # Summary
+    # ---------------------------------------------------------------------
+    - name: Summary
+      ansible.builtin.debug:
+        msg:
+          - "Rapid7 supported: {{ rapid7_supported }}"
+          - "Rapid7 configure rc: {{ r7_configure.rc | default('n/a') }}"
+          - "Rapid7 service start/enable attempted"
+          - "SentinelOne token set rc: {{ s1_token_set.rc | default('n/a') }}"
+          - "SentinelOne service start/enable attempted"
+
+
+    - name: Check SentinelOne service status
+      become: true
+      ansible.builtin.command: systemctl status sentinelone.service --no-pager
+      register: s1_status
+      changed_when: false
+      failed_when: false
+
+    - name: Show SentinelOne service status
+      ansible.builtin.debug:
+        var: s1_status.stdout_lines
+
+    - name: Check Rapid7 ir_agent service status
+      when: rapid7_supported
+      become: true
+      ansible.builtin.command: systemctl status ir_agent.service --no-pager
+      register: r7_status
+      changed_when: false
+      failed_when: false
+
+    - name: Show Rapid7 ir_agent service status
+      when: rapid7_supported
+      ansible.builtin.debug:
+        var: r7_status.stdout_lines

@@ -1,0 +1,347 @@
+# -------- Ubuntu (UFW + auto updates, no auto upgrades) --------
+#
+- name: Ensure SELinux management tools are installed
+  when: ansible_facts.os_family == 'RedHat'
+  ansible.builtin.package:
+    name:
+      - policycoreutils-python-utils  # RHEL 8/9
+      - policycoreutils-python        # RHEL 7 (will just skip if not present)
+    state: present
+
+- name: Configure SELinux (RHEL-family)
+  include_tasks: selinux.yml
+  when: ansible_os_family == 'RedHat'
+
+- name: Configure AppArmor (Debian/Ubuntu)
+  include_tasks: apparmor.yml
+  when: ansible_os_family == 'Debian'
+
+- name: Ensure reboot-required.d exists
+  ansible.builtin.file:
+    path: /var/run/reboot-required.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when:
+    - os_settings_reboot_required | default(false)
+    - not (reboot_when_required | default(false))
+
+- name: Create /var/run/reboot-required marker when needed
+  ansible.builtin.copy:
+    dest: /var/run/reboot-required
+    content: "Reboot required by os_settings role.\n"
+    owner: root
+    group: root
+    mode: "0644"
+  when:
+    - os_settings_reboot_required | default(false)
+    - not (reboot_when_required | default(false))
+
+- name: Add detailed reasons to reboot-required.d
+  ansible.builtin.copy:
+    dest: /var/run/reboot-required.d/os_settings
+    content: "{{ (os_settings_reboot_reasons | default([])) | join('\n') ~ '\n' }}"
+    owner: root
+    group: root
+    mode: "0644"
+  when:
+    - os_settings_reboot_required | default(false)
+    - not (reboot_when_required | default(false))
+
+- name: WARN — reboot is required to finalize security settings
+  ansible.builtin.debug:
+    msg: >-
+      Reboot is required to finalize security settings.
+      Reasons:
+      {% for r in os_settings_reboot_reasons | default(['unknown']) %}
+      - {{ r }}
+      {% endfor %}
+      Automatic reboot suppressed (reboot_when_required=false).
+  when:
+    - os_settings_reboot_required | default(false)
+    - not (reboot_when_required | default(false))
+
+
+
+- name: Install python globally
+  include_tasks: python_global_install.yml
+  #automatic_restart.yml
+  #
+- name: Disable automatic restart
+  include_tasks: automatic_restart.yml
+
+- name: Auto update policy security (Ubuntu / Rhel)
+  when: ansible_os_family in ['Debian', 'RedHat']
+  include_tasks: auto-update_rhel_ubuntu_security.yml
+
+- name: Baseline OS packages
+  when: ansible_os_family == 'RedHat' or ansible_os_family == 'Debian'
+  include_tasks: baseline_os_packages.yml
+
+- name: Time sync (chrony)
+  include_tasks: chrony.yml
+
+- name: Install RDP start/stop units and timers
+  when: ansible_os_family == 'RedHat'
+  ansible.builtin.template:
+    src: "{{ item }}"
+    dest: "/etc/systemd/system/{{ item | regex_replace('\\.j2$', '') }}"
+    mode: "0644"
+  loop:
+    - "rdp-start.service.j2"
+    - "rdp-stop.service.j2"
+    - "rdp-start.timer.j2"
+    - "rdp-stop.timer.j2"
+
+
+- name: Reload systemd and ensure RDP timers are enabled & running
+  when: ansible_os_family == 'RedHat'
+  block:
+    - ansible.builtin.systemd:
+        daemon_reload: true
+    - ansible.builtin.systemd:
+        name: "{{ item }}"
+        enabled: true
+        state: started
+      loop:
+        - rdp-start.timer
+        - rdp-stop.timer
+
+
+
+- name: Apply sysctl params
+  when:
+    - manage_sysctl | default(true)
+    - ansible_system == 'Linux'
+  loop: "{{ sysctl_params | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  ansible.posix.sysctl:
+    name: "{{ item.key }}"
+    value: "{{ item.value }}"
+    sysctl_file: "{{ sysctl_file | default('/etc/sysctl.d/99-hardening.conf') }}"
+    state: present
+    reload: true
+
+# Ubuntu hardening, UFW, and APT policy
+- name: Ubuntu hardening, UFW, and APT policy
+  when: ansible_os_family == 'Debian'
+  block:
+
+    - name: Allow OpenSSH in UFW (safety)
+      ufw:
+        rule: allow
+        name: OpenSSH
+
+    - name: Enable UFW (default deny inbound)
+      ufw:
+        state: enabled
+        policy: deny
+
+
+    - name: Allow extra TCP ports in UFW (from allowed_tcp_ports_ubuntu, excluding 22)
+      ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+      loop: "{{ (allowed_tcp_ports_ubuntu | default([])) | difference(['22']) }}"
+
+    - name: Allow UDP ports in UFW
+      ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: udp
+      loop: "{{ firewall_udp_ports | default([]) }}"
+
+- name: Ensure OpenSSH server is installed
+  package:
+    name: "{{ (ansible_os_family == 'RedHat') | ternary('openssh-server','openssh-server') }}"
+    state: present
+
+
+# tasks/main.yml (or wherever you want it)
+- name: Render hardened sshd_config
+  ansible.builtin.template:
+    src: sshd_config.j2
+    dest: "{{ sshd_config_path | default('/etc/ssh/sshd_config') }}"
+    owner: root
+    group: root
+    mode: "0644"
+    backup: yes
+    # Validate atomically; file is not installed if this fails
+    validate: "/usr/sbin/sshd -t -f %s"
+  notify: reload ssh
+
+
+- name: Skipping Ubuntu-specific hardening on non-Debian host
+  ansible.builtin.debug:
+    msg: >-
+      Skipping Ubuntu/Debian UFW & sshd hardening because ansible_os_family={{ ansible_os_family }}
+      ({{ ansible_distribution }} {{ ansible_distribution_version }}). This host uses the RHEL/Oracle path.
+  when: ansible_os_family != 'Debian'
+
+
+
+# RHEL/Oracle firewalld
+- name: RHEL/Oracle firewalld
+  when: ansible_os_family == 'RedHat'
+  block:
+    - name: Ensure firewalld is installed
+      package:
+        name: firewalld
+        state: present
+
+    - name: Ensure firewalld is running and enabled
+      service:
+        name: firewalld
+        state: started
+        enabled: yes
+
+    - name: Ensure SSH service allowed (safety)
+      firewalld:
+        service: ssh
+        zone: "{{ firewalld_zone }}"
+        state: enabled
+        permanent: yes
+        immediate: yes
+
+    - name: Allow extra TCP ports in firewalld (from allowed_tcp_ports_rhel, excluding 22)
+      firewalld:
+        port: "{{ item }}/tcp"
+        zone: "{{ firewalld_zone }}"
+        state: enabled
+        permanent: yes
+        immediate: yes
+      loop: "{{ (allowed_tcp_ports_rhel | default([])) | difference(['22']) }}"
+
+    - name: Allow UDP ports in firewalld
+      firewalld:
+        port: "{{ item }}/udp"
+        zone: "{{ firewalld_zone }}"
+        state: enabled
+        permanent: yes
+        immediate: yes
+      loop: "{{ firewall_udp_ports | default([]) }}"
+
+- name: Skipping RHEL/Oracle firewalld on non-RedHat host
+  ansible.builtin.debug:
+    msg: >-
+      Skipping RHEL/Oracle firewalld because ansible_os_family={{ ansible_os_family }}
+      ({{ ansible_distribution }} {{ ansible_distribution_version }}). This host uses the Debian/UFW path.
+  when: ansible_os_family != 'RedHat'
+
+
+- name: Oracle pre-shutdown (RHEL only)
+  when: ansible_os_family == 'RedHat'
+  become: true
+  block:
+    - name: Install pre-shutdown unit
+      ansible.builtin.template:
+        src: oracle-pre-shutdown.service.j2
+        dest: /etc/systemd/system/oracle-pre-shutdown.service
+        mode: "0644"
+      notify: systemd daemon-reload
+
+    - name: Enable/start pre-shutdown unit
+      ansible.builtin.systemd:
+        name: oracle-pre-shutdown.service
+        enabled: yes
+        state: started
+
+    - name: Verify unit syntax (RHEL only)
+      when: ansible_os_family == 'RedHat'
+      become: true
+      command: systemd-analyze verify /etc/systemd/system/oracle-pre-shutdown.service
+      changed_when: false
+
+
+# Set the banaction per OS family
+- name: Set Fail2ban banaction for Ubuntu/Debian
+  when: ansible_os_family == 'Debian'
+  set_fact:
+    fail2ban_banaction: ufw
+
+- name: Set Fail2ban banaction for RHEL/Oracle
+  when: ansible_os_family == 'RedHat'
+  set_fact:
+    fail2ban_banaction: firewallcmd-rich-rules   # requires running firewalld
+
+# -------- Fail2ban on Ubuntu & RHEL/Oracle --------
+- name: Fail2ban (all)
+  block:
+    - name: Install Fail2ban
+      when: fail2ban | default(true)
+      package:
+        name: fail2ban
+        state: present
+
+    - name: Drop unified jail.local (uses your vars; sshd jail enabled)
+      when: fail2ban | default(true)
+      copy:
+        dest: "{{ jail_path | default('/etc/fail2ban/jail.local') }}"
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [DEFAULT]
+          backend  = {{ backend | default('systemd') }}
+          bantime  = {{ bantime | default('10m') }}
+          findtime = {{ findtime | default('10m') }}
+          maxretry = {{ maxretry | default(5) }}
+          {% if ignoreip is defined and ignoreip|length > 0 %}
+          ignoreip = {{ (ignoreip | join(' ')) }}
+          {% endif %}
+
+          # OS-specific firewall hook (this is the piece you were missing)
+          banaction = {{ fail2ban_banaction }}
+          # keep the simple wrapper; change to %(action_mw)s if you want mail
+          action = %(action_)s
+
+          [sshd]
+          enabled = true
+          port = ssh
+
+    - name: Ensure Fail2ban running
+      when: fail2ban | default(true)
+      systemd:
+        name: fail2ban
+        state: started
+        enabled: yes
+
+
+    - name: Stop/disable Fail2ban when disabled
+      when: not (fail2ban | default(true))
+      block:
+        - systemd:
+            name: fail2ban
+            state: stopped
+            enabled: no
+            masked: yes
+          ignore_errors: yes
+        - package:
+            name: fail2ban
+            state: absent
+        - file:
+            path: "{{ jail_path | default('/etc/fail2ban/jail.local') }}"
+            state: absent
+          when: ansible_os_family in ['Debian', 'RedHat']
+
+- name: Ensure auditd installed and capturing AppArmor denials (Ubuntu/Debian)
+  when: ansible_os_family == 'Debian'
+  block:
+
+    # Ensure auditd is using the standard log path
+    - name: Configure auditd log file path
+      ansible.builtin.lineinfile:
+        path: /etc/audit/auditd.conf
+        regexp: '^log_file\s*='
+        line: 'log_file = /var/log/audit/audit.log'
+        backup: yes
+      notify: restart auditd
+
+    - name: Ensure auditd service enabled and running
+      ansible.builtin.systemd:
+        name: auditd
+        enabled: yes
+        state: started

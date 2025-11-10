@@ -1,0 +1,7 @@
+View if selinux is enabled
+getenforce
+sestatus
+
+grep -i avc /var/log/audit/audit.log | tail -n 30
+or
+ausearch -m avc -ts recent

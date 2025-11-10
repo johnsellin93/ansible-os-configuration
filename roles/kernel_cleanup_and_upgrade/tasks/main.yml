@@ -1,0 +1,635 @@
+
+# --- Role summary (banner) ----------------------------------------------------
+- name: Build role summary banner
+  ansible.builtin.set_fact:
+    banner_msg:
+      - "Target OS: ID={{ os_id | default('?') }}, VERSION_ID={{ os_version_id | default('?') }}, ID_LIKE={{ os_id_like_raw | default('?') }}"
+      - "Guardrails:"
+      - "  • Abort on Ubuntu/Debian (ID in [ubuntu,debian] or ID_LIKE contains debian)"
+      - "  • Abort if VERSION_ID matches 9.6"
+      - "dnf-automatic state:"
+      - "  • apply_updates=no in /etc/dnf/automatic.conf"
+      - "  • timers/services stopped, disabled, masked"
+      - "  • drop-ins removed; systemd reloaded"
+      - "  • package removal={{ (dnf_automatic_remove_pkg | default(false)) | bool }}"
+      - "Housekeeping:"
+      - "  • installonly_limit={{ installonly_limit_value | default(2) }} in /etc/dnf/dnf.conf"
+      - "  • dnf clean all; makecache --refresh"
+      - "Kernel management:"
+      - "  • Prune old installonly packages"
+      - "  • Keep newest + running per stream (RHCK/UEK)"
+      - "  • Remove RHCK if standardizing on UEK (never remove running)"
+      - "Safety checks:"
+      - "  • Assert at least one kernel per stream remains"
+      - "  • Require /boot free space ≥ {{ boot_min_free_mb | default(360) }} MiB before upgrade"
+      - "Observability:"
+      - "  • Log running/default kernel, list installed kernels"
+      - "  • Summarize RHCK/UEK counts and /boot vmlinuz images"
+      - "Screening/ops helper:"
+      - "  • Ensure tmux; create session 'anticimex'"
+      - "  • Apply 'dnf upgrade --refresh' in tmux session"
+
+
+- name: Role summary (banner)
+  ansible.builtin.debug:
+    msg: "{{ banner_msg }}"
+
+
+# --- Logging / basics ---------------------------------------------------------
+- name: Detect OS ID, VERSION_ID and ID_LIKE from /etc/os-release
+  ansible.builtin.shell: '. /etc/os-release && printf "%s;%s;%s" "$ID" "$VERSION_ID" "${ID_LIKE:-}"'
+  register: os_release
+  changed_when: false
+
+
+- name: Set OS facts (reuse os_version_id)
+  ansible.builtin.set_fact:
+    os_id: "{{ (os_release.stdout.split(';')[0] | lower) }}"
+    os_version_id: "{{ (os_release.stdout.split(';')[1] | trim) }}"
+    os_id_like_raw: "{{ (os_release.stdout.split(';')[2] | lower) }}"
+    os_id_like_list: "{{ os_release.stdout.split(';')[2].split() | map('lower') | list }}"
+
+
+# Fail on Debian/Ubuntu before any DNF logic
+- name: Fail on Ubuntu/Debian systems
+  ansible.builtin.fail:
+    msg: >-
+      This playbook must not run on Ubuntu/Debian hosts (ID={{ os_id }},
+      VERSION_ID={{ os_version_id }}, ID_LIKE={{ os_id_like_raw }}). Aborting.
+  when: >
+    (os_id in ['ubuntu', 'debian'])
+    or ('debian' in os_id_like_list)
+
+
+- name: Fail if version already is 9.6
+  ansible.builtin.fail:
+    msg: "Host is already at VERSION_ID={{ os_version_id }}; aborting as requested."
+  when: os_version_id is match('^9\.6(\.|$|-)')
+
+# --- dnf-automatic: disable unattended upgrades --------------------------------
+
+- name: Ensure dnf-automatic config does not apply updates
+  become: true
+  ansible.builtin.ini_file:
+    path: /etc/dnf/automatic.conf
+    section: commands
+    option: apply_updates
+    value: "no"
+    mode: "0644"
+    backup: yes
+
+# Stop/disable/mask commonly seen timers/services
+- name: Disable and mask dnf-automatic timers
+  become: true
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: stopped
+    enabled: false
+    masked: true
+  loop:
+    - dnf-automatic.timer
+    - dnf-automatic-install.timer
+  failed_when: false
+
+
+- name: Disable and mask dnf-automatic services
+  become: true
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: stopped
+    enabled: false
+    masked: true
+  loop:
+    - dnf-automatic.service
+    - dnf-automatic-install.service
+  failed_when: false
+
+# Clean up any previous overrides you might have added
+- name: Remove systemd drop-ins for dnf-automatic
+  become: true
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/systemd/system/dnf-automatic.timer.d
+    - /etc/systemd/system/dnf-automatic-install.timer.d
+
+
+- name: Reload systemd after changes
+  become: true
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+
+- name: Ensure installonly_limit
+  become: true
+  lineinfile:
+    path: /etc/dnf/dnf.conf
+    regexp: '^installonly_limit\s*='
+    line: "installonly_limit={{ installonly_limit_value | default(2) }}"
+    create: yes
+    backup: yes
+
+# housekeeping that can free space or fix metadata
+- name: dnf clean helpful if /var is tight or metadata is flaky)
+  become: true
+  command: dnf clean all
+  changed_when: false
+
+
+# 4) clear stale /boot *.tmp early (saves a few MB)
+- name: Remove stale .tmp files from /boot early
+  become: true
+  shell: "find /boot -maxdepth 1 -type f -name '*.tmp' -print -delete || true"
+  changed_when: false
+
+
+- name: Log running and default kernels
+  shell: |
+    echo "running=$(uname -r)"
+    echo "default=$(grubby --default-kernel || true)"
+  register: kernel_info
+  changed_when: false
+
+
+- debug: var=kernel_info.stdout_lines
+
+# tar bort gamla kärnor tills installonly_limit är nått per paketnamn, så båda kärnorna (UEK och RHCK) hålls i två versioner.
+- name: Preview oldinstallonly removals
+  become: true
+  command: dnf remove --oldinstallonly --assumeno --setopt=color=never
+  environment:
+    LC_ALL: C
+  register: preview_prune
+  changed_when: false
+  failed_when: false
+
+# show full raw stdout at normal verbosity
+- name: Oldinstallonly preview (full text)
+  ansible.builtin.debug:
+    var: preview_prune.stdout
+
+# Parse just the "Removing:" block into a list of lines
+- name: Extract list of packages that would be removed
+  vars:
+    _after_removing: >-
+      {{
+        (preview_prune.stdout.split('Removing:') | length > 1)
+        | ternary(preview_prune.stdout.split('Removing:')[1], '')
+      }}
+    _rem_block: "{{ _after_removing.split('\n\n')[0] }}"
+  set_fact:
+    oldinstallonly_would_remove_lines: >-
+      {{
+        _rem_block.splitlines()
+        | map('trim')
+        | reject('equalto','')
+        | reject('match','^(Name|Arch|Version|Repository|Size)$')
+        | list
+      }}
+
+
+- name: Packages that would be removed (preview)
+  ansible.builtin.debug:
+    msg: "{{ oldinstallonly_would_remove_lines }}"
+
+
+- name: Prune old installonly packages
+  become: true
+  command: dnf -y remove --oldinstallonly
+  register: prune_result
+  changed_when: "'Removed:' in prune_result.stdout or 'Removed:' in prune_result.stderr"
+
+# If standardizing on UEK, remove only RHCK *kernel* payloads (not kernel-tools, headers, etc.)
+- name: Remove RHCK kernels if standardizing on UEK (safe, never remove running)
+  become: true
+  ansible.builtin.shell:
+    cmd: |
+      set -euo pipefail
+      RUNNING="$(uname -r)"
+      RHCK_PKGS=$(
+        rpm -qa --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\n' \
+          kernel kernel-core kernel-modules kernel-modules-core 2>/dev/null |
+        awk -v ver="$RUNNING" '($0 !~ ("-" ver "$")) && NF' || true
+      )
+      if [ -n "$RHCK_PKGS" ]; then
+        echo "Removing RHCK kernels (excluding running: $RUNNING):"
+        if ! xargs -r dnf -y remove <<<"$RHCK_PKGS"; then
+          echo "DNF refused removal (likely protected packages). Skipping."
+          exit 0
+        fi
+      else
+        echo "Nothing to remove (RHCK) after excluding running kernel $RUNNING"
+      fi
+    executable: /bin/bash
+  failed_when: >
+    (rc | default(0)) != 0
+    and ('protected packages' not in (stderr | default('') | lower))
+    and ('nothing to remove' not in (stdout | default('') | lower))
+  when: (kernel_stream | default('')) == 'uek'
+
+# --- Dual-stream minimal retention (newest + running per stream) -------------
+- block:
+    - name: Running kernel
+      shell: uname -r
+      register: running_kernel
+      changed_when: false
+
+
+    - name: Gather RHCK versions (pre-cleanup)
+      shell: "rpm -qa --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' kernel-core | sort -V"
+      register: rhck_versions
+      changed_when: false
+
+
+    - name: Gather UEK versions (pre-cleanup)
+      shell: "rpm -qa --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' kernel-uek-core | sort -V"
+      register: uek_versions
+      changed_when: false
+
+
+    - name: Normalize versions + running
+      set_fact:
+        run_ver: "{{ running_kernel.stdout | trim }}"
+        rhck_all: "{{ rhck_versions.stdout_lines | default([]) | map('trim') | reject('equalto','') | list }}"
+        uek_all:  "{{ uek_versions.stdout_lines  | default([]) | map('trim') | reject('equalto','') | list }}"
+
+
+    - name: Compute newest per stream
+      set_fact:
+        newest_rhck: "{{ (rhck_all | length > 0) | ternary(rhck_all[-1], '') }}"
+        newest_uek:  "{{ (uek_all  | length > 0) | ternary(uek_all[-1],  '') }}"
+
+
+    - name: Compute keep sets (newest + running per stream)
+      set_fact:
+        rhck_keep: >-
+          {{ (([rhck_all[-1]] if rhck_all|length>0 else [])
+              + ([run_ver] if (run_ver is search('(^|-)el[0-9]([^a-z]|$)') and (run_ver is not search('uek'))) else []))
+              | unique }}
+        uek_keep: >-
+          {{ (([uek_all[-1]]  if uek_all|length>0  else [])
+              + ([run_ver] if (run_ver is search('uek')) else []))
+              | unique }}
+
+
+    - name: Safety – ensure at least one kernel per present stream remains
+      assert:
+        that:
+          - (rhck_versions.stdout_lines | length == 0) or (rhck_keep | length >= 1)
+          - (uek_versions.stdout_lines  | length == 0) or (uek_keep  | length >= 1)
+        fail_msg: "Safety check failed: would remove all kernels of a stream."
+        success_msg: "Safety OK: will keep newest (and running) per stream."
+
+
+    - name: Compute remove sets
+      set_fact:
+        rhck_remove: "{{ rhck_all | difference(rhck_keep | default([])) }}"
+        uek_remove:  "{{ uek_all  | difference(uek_keep  | default([])) }}"
+
+    # RHCK: remove only installed packages for each version (exact NEVRAs)
+    - name: Remove older RHCK (leave newest and running) - exact packages only
+      become: true
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+          PKS=( "kernel-core-$VER" "kernel-modules-$VER" "kernel-modules-core-$VER" "kernel-$VER" )
+          TO_RM=()
+          for P in "${PKS[@]}"; do
+            if rpm -q "$P" >/dev/null 2>&1; then
+              TO_RM+=("$P")
+            fi
+          done
+          if [ ${#TO_RM[@]} -gt 0 ]; then
+            echo "Removing: ${TO_RM[*]}"
+            if ! dnf -y remove "${TO_RM[@]}"; then
+              echo "DNF refused removal (likely protected packages). Skipping."
+              exit 0
+            fi
+          else
+            echo "Nothing to remove for RHCK $VER"
+          fi
+        executable: /bin/bash
+      environment:
+        VER: "{{ item }}"
+      loop: "{{ rhck_remove }}"
+      loop_control: { label: "{{ item }}" }
+      register: rhck_remove_result
+      changed_when: "'Removing:' in (stdout | default(''))"
+      failed_when: >
+        (rc | default(0)) != 0
+        and ('nothing to remove' not in (stdout | default('') | lower))
+        and ('protected packages' not in (stderr | default('') | lower))
+      when:
+        - rhck_remove | length > 0
+        - item != run_ver
+        - item != newest_rhck
+
+
+    - name: Remove older UEK (leave newest and running) - exact packages only
+      become: true
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+          PKS=( "kernel-uek-core-$VER" "kernel-uek-modules-$VER" "kernel-uek-$VER" )
+          TO_RM=()
+          for P in "${PKS[@]}"; do
+            if rpm -q "$P" >/dev/null 2>&1; then
+              TO_RM+=("$P")
+            fi
+          done
+          if [ ${#TO_RM[@]} -gt 0 ]; then
+            echo "Removing: ${TO_RM[*]}"
+            if ! dnf -y remove "${TO_RM[@]}"; then
+              echo "DNF refused removal (likely protected packages). Skipping."
+              exit 0
+            fi
+          else
+            echo "Nothing to remove for UEK $VER"
+          fi
+        executable: /bin/bash
+      environment:
+        VER: "{{ item }}"
+      loop: "{{ uek_remove }}"
+      loop_control: { label: "{{ item }}" }
+      register: uek_remove_result
+      changed_when: "'Removing:' in (stdout | default(''))"
+      failed_when: >
+        (rc | default(0)) != 0
+        and ('nothing to remove' not in (stdout | default('') | lower))
+        and ('protected packages' not in (stderr | default('') | lower))
+      when:
+        - uek_remove | length > 0
+        - item != run_ver
+        - item != newest_uek
+
+
+    # --- Summary: how many kernels remain ---------------------
+    - name: Gather installed RHCK versions (kernel-core)
+      ansible.builtin.shell: "rpm -qa --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' kernel-core | sort -V"
+      register: rhck_list
+      changed_when: false
+
+
+    - name: Gather installed UEK versions (kernel-uek-core)
+      ansible.builtin.shell: "rpm -qa --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' kernel-uek-core | sort -V"
+      register: uek_list
+      changed_when: false
+
+
+    - name: Set summary facts
+      ansible.builtin.set_fact:
+        rhck_versions_installed: "{{ rhck_list.stdout_lines | default([]) | reject('equalto','') | list }}"
+        uek_versions_installed:  "{{ uek_list.stdout_lines  | default([]) | reject('equalto','') | list }}"
+        rhck_count: "{{ (rhck_list.stdout_lines | default([]) | reject('equalto','') | list) | length }}"
+        uek_count:  "{{ (uek_list.stdout_lines  | default([]) | reject('equalto','') | list) | length }}"
+        total_kernel_pkgs: >-
+          {{
+            (rhck_list.stdout_lines | default([]) | reject('equalto','') | list | length)
+            +
+            (uek_list.stdout_lines  | default([]) | reject('equalto','') | list | length)
+          }}
+
+
+    - name: Default boot kernel (if grubby exists)
+      ansible.builtin.command: grubby --default-kernel
+      register: grubby_def
+      changed_when: false
+      failed_when: false
+      args: { warn: false }
+
+
+    - name: Count bootable kernels present in /boot (vmlinuz files)
+      ansible.builtin.shell: "ls -1 /boot/vmlinuz-* 2>/dev/null | wc -l"
+      register: boot_vmlinuz_count
+      changed_when: false
+
+
+    - name: Report kernel summary
+      ansible.builtin.debug:
+        msg:
+          - "Running kernel: {{ ansible_kernel | default('unknown') }}"
+          - "Default kernel: {{ grubby_def.stdout | default('unknown') | trim }}"
+          - "RHCK kernels installed: {{ rhck_count }} -> {{ rhck_versions_installed | join(', ') | default('none') }}"
+          - "UEK  kernels installed: {{ uek_count  }} -> {{ uek_versions_installed  | join(', ') | default('none') }}"
+          - "vmlinuz images in /boot: {{ (boot_vmlinuz_count.stdout | int) }}"
+
+
+    - name: Check /boot free space (MiB)
+      ansible.builtin.shell: df -Pm /boot | awk 'NR==2{print $4}'
+      register: boot_free_mb
+      changed_when: false
+
+
+    # Stop creating the big 0-rescue image on future kernel installs
+    - name: Ensure kernel install.d directory exists
+      become: true
+      ansible.builtin.file:
+        path: /etc/kernel/install.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    # Keep only the current rescue pair (by machine-id), delete any older ones
+    - name: Read machine-id
+      become: true
+      ansible.builtin.command: cat /etc/machine-id
+      register: machine_id
+      changed_when: false
+
+    - name: Disable rescue initramfs generation (dracut-rescue hook)
+      become: true
+      ansible.builtin.copy:
+        dest: /etc/kernel/install.d/51-dracut-rescue.install
+        owner: root
+        group: root
+        mode: "0755"
+        content: |
+          #!/bin/sh
+          # Ansible-managed: disable building the 0-rescue initramfs
+          exit 0
+
+
+    - name: Find rescue initramfs images
+      become: true
+      ansible.builtin.find:
+        paths: /boot
+        patterns: "initramfs-0-rescue-*.img"
+        file_type: file
+      register: rescue_initramfs
+
+    - name: Find rescue vmlinuz files
+      become: true
+      ansible.builtin.find:
+        paths: /boot
+        patterns: "vmlinuz-0-rescue-*"
+        file_type: file
+      register: rescue_vmlinuz
+
+    - name: Select old rescue initramfs (exclude current machine-id)(initramsfs)
+      ansible.builtin.set_fact:
+        old_rescue_initramfs: >-
+          {{ rescue_initramfs.files
+             | rejectattr('path', 'equalto', '/boot/initramfs-0-rescue-' ~ machine_id.stdout ~ '.img')
+             | list }}
+
+    - name: Select old rescue vmlinuz (exclude current machine-id)(vmlinuz.files)
+      ansible.builtin.set_fact:
+        old_rescue_vmlinuz: >-
+          {{ rescue_vmlinuz.files
+             | rejectattr('path', 'equalto', '/boot/vmlinuz-0-rescue-' ~ machine_id.stdout)
+             | list }}
+
+    - name: Remove old rescue initramfs files
+      become: true
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ old_rescue_initramfs }}"
+      loop_control: { label: "{{ item.path }}" }
+
+    - name: Remove old rescue vmlinuz files
+      become: true
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ old_rescue_vmlinuz }}"
+      loop_control: { label: "{{ item.path }}" }
+
+    # Tiny crumbs in /boot
+    - name: Remove stale /boot *.tmp files
+      become: true
+      ansible.builtin.find:
+        paths: /boot
+        patterns: "*.tmp"
+        file_type: file
+      register: boot_tmp_files
+
+    - name: Delete stale /boot *.tmp files
+      become: true
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ boot_tmp_files.files }}"
+      loop_control: { label: "{{ item.path }}" }
+
+
+    - name: Fail if /boot still too small
+      ansible.builtin.fail:
+        msg: "Only {{ boot_free_mb.stdout }} MiB free in /boot; need at least {{ boot_min_free_mb | default(360) }} MiB before upgrade."
+      when: (boot_free_mb.stdout | int) < (boot_min_free_mb | default(360) | int)
+
+  tags: [rescue_cleanup]
+
+# --- Kick off upgrade in tmux -------------------------------------------------
+- name: Ensure tmux is installed
+  become: true
+  ansible.builtin.dnf:
+    name: tmux
+    state: present
+  tags: [screen]
+
+- name: Check if upgrade session exists
+  ansible.builtin.command: tmux list-sessions
+  register: tmux_sessions
+  changed_when: false
+  failed_when: false
+  tags: [screen]
+
+- name: Create session for upgrade
+  tags: [screen]
+  ansible.builtin.shell: "tmux new-session -d -s anticimex; sleep 2"
+  args: { executable: /bin/bash }
+  when: "'anticimex' not in tmux_sessions.stdout"
+
+- name: Upgrade kernel (kick off in tmux)
+  tags: kernel
+  become: true
+  ansible.builtin.shell: >
+    tmux send-keys -t anticimex 'dnf upgrade -y --refresh' Enter
+  when: (boot_free_mb.stdout | int) >= (boot_min_free_mb | default(400) | int)
+  register: upgrade_kicked
+
+- name: Wait until dnf starts (pid appears)
+  ansible.builtin.stat:
+    path: /run/dnf.pid
+  register: dnf_pid
+  until: dnf_pid.stat.exists
+  retries: 40
+  delay: 3
+  failed_when: false
+  when: upgrade_kicked is succeeded
+
+# --- Block until upgrade completes -------------------------------------------
+- name: Wait for dnf to finish (pid removed)
+  ansible.builtin.stat:
+    path: /run/dnf.pid
+  register: dnf_done
+  until: not dnf_done.stat.exists
+  retries: 240
+  delay: 30
+  when: upgrade_kicked is succeeded
+
+- name: Wait for RPM DB lock to clear
+  ansible.builtin.stat:
+    path: /var/lib/rpm/.rpm.lock
+  register: rpm_lock
+  until: not rpm_lock.stat.exists
+  retries: 240
+  delay: 15
+  when: upgrade_kicked is succeeded
+
+- name: Wait for yum compat pid to clear
+  ansible.builtin.stat:
+    path: /run/yum.pid
+  register: yum_pid
+  until: not yum_pid.stat.exists
+  retries: 240
+  delay: 15
+  failed_when: false
+  when: upgrade_kicked is succeeded
+
+# --- Post-upgrade cleanup (now dnf is idle) ----------------------------------
+- name: Prune old installonly kernels
+  become: true
+  command: dnf -y remove --oldinstallonly
+  register: post_prune_result
+  changed_when: "'Removed:' in (post_prune_result.stdout | default('') + post_prune_result.stderr | default(''))"
+  tags: [kernel_cleanup]
+
+# (Optional) If standardizing on UEK, remove non-running RHCK kernels
+- name: Remove RHCK kernels if standardizing on UEK (never remove running)
+  become: true
+  ansible.builtin.shell: |
+    set -euo pipefail
+    RUNNING="$(uname -r)"
+    RHCK_PKGS=$(
+      rpm -qa --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\n' \
+        kernel kernel-core kernel-modules kernel-modules-core 2>/dev/null |
+      awk -v ver="$RUNNING" '($0 !~ ("-" ver "$")) && NF' || true
+    )
+    if [ -n "$RHCK_PKGS" ]; then
+      xargs -r dnf -y remove <<<"$RHCK_PKGS" || true
+    fi
+  args: { executable: /bin/bash }
+  when: (kernel_stream | default('')) == 'uek'
+  tags: [kernel_cleanup]
+
+
+- name: List installed UEK kernels
+  ansible.builtin.command: rpm -q kernel-uek --last
+  register: uek
+  changed_when: false
+  failed_when: false
+
+
+- name: Pretty output
+  ansible.builtin.debug:
+    msg:
+      - "Running kernel: {{ ansible_kernel | default('unknown') }}"
+      - "Default boot:   {{ grubby_def.stdout | default('unknown') }}"
+      - "RHCK kernels:"
+      - "{{ rhck.stdout_lines | default(['(none)']) }}"
+      - "UEK kernels:"
+      - "{{ uek.stdout_lines | default(['(none)']) }}"

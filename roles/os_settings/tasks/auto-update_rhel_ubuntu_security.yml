@@ -1,0 +1,165 @@
+---
+- name: Disable/stop dnf-automatic to avoid conflicts
+  when: ansible_os_family == 'RedHat'
+  block:
+    - systemd:
+        name: dnf-automatic.timer
+        state: stopped
+        enabled: no
+      ignore_errors: yes
+    - package:
+        name: dnf-automatic
+        state: absent
+
+# needs-restarting is in dnf-utils (EL8/EL9)
+- name: Ensure needs-restarting is available
+  when: ansible_os_family == 'RedHat' and unattended_auto_update_security | bool
+  package:
+    name: dnf-utils
+    state: present
+
+- name: Install dnf-security-update.service (security-only update)
+  when: ansible_os_family == 'RedHat' and unattended_auto_update_security | bool
+  copy:
+    dest: /etc/systemd/system/dnf-security-update.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=DNF security-only update
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/bin/dnf -y update --security
+      # Post-check: if reboot is required, create a flag file and keep service successful
+      ExecStartPost=/usr/bin/needs-restarting -r || /usr/bin/touch /var/run/reboot-required
+      Nice=10
+
+- name: Install dnf-security-update.timer (15th @ 15:00 monthly)
+  when: ansible_os_family == 'RedHat' and unattended_auto_update_security | bool
+  copy:
+    dest: /etc/systemd/system/dnf-security-update.timer
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Schedule DNF security-only updates
+
+      [Timer]
+      OnCalendar={{ security_update_calendar }}
+      Persistent=true
+
+      [Install]
+      WantedBy=timers.target
+
+- name: Enable & start timer
+  when: ansible_os_family == 'RedHat' and unattended_auto_update_security | bool
+  systemd:
+    name: dnf-security-update.timer
+    state: started
+    enabled: yes
+    daemon_reload: yes
+
+
+################################################################################
+# --- Debian/Ubuntu: security-only monthly updates (15th @ 15:00) ---
+- name: Debian/Ubuntu — security-only auto update on a timer
+  when: ansible_os_family == 'Debian'
+  block:
+    - name: Ensure helpers present (unattended + reboot flag + service restart summary)
+      apt:
+        name:
+          - unattended-upgrades
+          - update-notifier-common    # writes /var/run/reboot-required & .pkgs when needed
+          - needrestart               # lists services that need restart (no reboot)
+        state: present
+        update_cache: yes
+
+    # SECURITY ONLY (robust: match -security archive explicitly; keep label patterns for compatibility)
+    - name: Configure unattended-upgrades for SECURITY ONLY
+      copy:
+        dest: /etc/apt/apt.conf.d/50unattended-upgrades
+        mode: "0644"
+        content: |
+          Unattended-Upgrade::Origins-Pattern {
+            "o=Ubuntu,a=${distro_codename}-security";
+            "o=Debian,a=${distro_codename}-security";
+            "origin=Ubuntu,codename=${distro_codename},label=Ubuntu-Security";
+            "origin=Debian,codename=${distro_codename},label=Debian-Security";
+          };
+          Unattended-Upgrade::MinimalSteps "true";
+          Unattended-Upgrade::Remove-Unused-Dependencies "false";
+          Unattended-Upgrade::Automatic-Reboot "false";
+
+    # Disable default daily timers so only our monthly timer runs
+    - name: Disable daily APT timers (we control the schedule)
+      systemd:
+        name: "{{ item }}"
+        state: stopped
+        enabled: no
+        masked: yes
+      loop:
+        - apt-daily.timer
+        - apt-daily-upgrade.timer
+      ignore_errors: yes
+
+    # One-shot service to run one security-only cycle and report reboot requirement + packages
+    - name: Install apt-security-update.service
+      when: unattended_auto_update_security | bool
+      copy:
+        dest: /etc/systemd/system/apt-security-update.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=APT security-only updates (unattended-upgrades)
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=oneshot
+          Nice=10
+          ExecStartPre=/usr/bin/apt-get update -o Acquire::Retries=3 -o Acquire::http::No-Cache=true
+          ExecStart=/usr/bin/unattended-upgrade
+          ExecStartPost=/bin/sh -c 'if [ -f /var/run/reboot-required ]; then \
+            echo "APT security update: REBOOT REQUIRED"; \
+            if [ -f /var/run/reboot-required.pkgs ]; then \
+              echo "Packages requiring reboot:"; cat /var/run/reboot-required.pkgs; \
+            fi; \
+          else \
+            echo "APT security update: no reboot required"; \
+          fi'
+          ExecStartPost=/usr/sbin/needrestart -s || true
+
+    # Monthly timer at 15:00 on the 15th (local time)
+    - name: Install apt-security-update.timer
+      when: unattended_auto_update_security | bool
+      copy:
+        dest: /etc/systemd/system/apt-security-update.timer
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Schedule APT security-only updates
+          [Timer]
+          OnCalendar={{ security_update_calendar }}
+          Persistent=true
+          [Install]
+          WantedBy=timers.target
+
+    - name: daemon-reload after writing APT units
+      when: unattended_auto_update_security | bool
+      systemd:
+        daemon_reload: yes
+    - name: Enable & start apt-security-update.timer
+      when: unattended_auto_update_security | bool
+      systemd:
+        name: apt-security-update.timer
+        state: started
+        enabled: yes
+
+    - name: Enable & start apt-security-update.timer
+      when: unattended_auto_update_security | bool
+      systemd:
+        name: apt-security-update.timer
+        state: started
+        enabled: yes
+        daemon_reload: yes

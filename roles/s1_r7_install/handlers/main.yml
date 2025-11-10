@@ -1,0 +1,5 @@
+---
+# Triggered by: notify: daemon-reload
+- name: daemon-reload
+  ansible.builtin.systemd:
+    daemon_reload: true

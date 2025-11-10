@@ -1,0 +1,99 @@
+################################################################################
+# OS_SETTINGS_ROLE — RHEL post-run verification (annotated)
+# Maps to vars in your play: allowed_tcp_ports_rhel, security timers, xrdp timers,
+# timesync_ntp_servers, selinux_state, fail2ban, Python env, etc.
+################################################################################
+
+
+# --- Oracle pre-shutdown (runs your stop script at shutdown) -------------------
+systemctl daemon-reload
+systemctl enable --now oracle-pre-shutdown.service
+
+# Dry-test ExecStop without reboot (should append to startup_shutdown.log)
+systemctl stop oracle-pre-shutdown.service
+# Re-start so it will trigger on next reboot
+systemctl start oracle-pre-shutdown.service
+
+# Inspect unit & log
+systemctl status oracle-pre-shutdown.service --no-pager
+tail -n 50 /home/oracle/scripts/startup_shutdown.log
+
+
+# --- Python global via pyenv (vars: python_venv_dir, python_version, env_global)
+python3 --version
+# Expect: Python 3.13.0 (from pyenv shims via /etc/profile.d/pyenv.sh + systemd env)
+
+# --- Firewall + Chrony services present (vars: packages.rhel includes firewalld, chrony)
+systemctl is-enabled --quiet firewalld && echo "firewalld enabled"
+systemctl is-active  --quiet firewalld && echo "firewalld active"
+systemctl is-enabled --quiet chronyd   && echo "chronyd enabled"
+systemctl is-active  --quiet chronyd   && echo "chronyd active"
+
+# --- Firewalld zone and rules (vars: firewalld_zone=public, allowed_tcp_ports_rhel, firewall_udp_ports)
+sudo firewall-cmd --get-active-zones        # Interfaces→zones; your rules are in 'public'
+sudo firewall-cmd --get-default-zone        # Should be 'public' unless customized
+sudo firewall-cmd --zone=public --list-services  # Expect 'ssh' present (safety rule)
+sudo firewall-cmd --zone=public --list-ports     # Expect '1521/tcp 3389/tcp 123/udp' (from vars)
+
+# --- DNF security-only updater timer (vars: unattended_auto_update_security=true, security_update_calendar)
+dnf updateinfo list security | head -20     # Security advisories exist (sanity)
+systemctl is-enabled dnf-security-update.timer && echo "sec timer enabled"
+systemctl is-active  dnf-security-update.timer && echo "sec timer active"
+systemctl list-timers dnf-security-update.timer   # Shows last/next run
+systemctl show dnf-security-update.timer -p NextElapseUSecRealtime
+systemctl cat  dnf-security-update.service | sed -n '1,120p'
+# Expect ExecStart: dnf -y update --security
+journalctl -u dnf-security-update.service -n 50 --no-pager   # Last run log; may set /var/run/reboot-required
+
+# --- Stock automation disabled (vars: automatic_restart: false; role stops/masks dnf-automatic & PackageKit)
+rpm -q dnf-automatic || echo "dnf-automatic not installed"
+systemctl is-enabled dnf-automatic.timer 2>/dev/null || echo "dnf-automatic.timer disabled"
+systemctl is-active  dnf-automatic.timer 2>/dev/null || echo "dnf-automatic.timer inactive"
+systemctl is-enabled packagekit.service 2>/dev/null || echo "packagekit disabled"
+systemctl is-active  packagekit.service 2>/dev/null || echo "packagekit inactive"
+# NOTE: The apt-daily checks are Ubuntu-only; safe to ignore on RHEL.
+
+# --- XRDP scheduled start/stop (vars: rdp_service=xrdp, rdp_timer_start, rdp_timer_pause)
+systemctl cat rdp-start.service   | sed -n '1,200p'  # Exec should start xrdp
+systemctl cat rdp-stop.service    | sed -n '1,200p'  # Exec should stop xrdp
+systemctl cat rdp-start.timer     | sed -n '1,200p'  # OnCalendar=* - * - * 06:00:00
+systemctl cat rdp-stop.timer      | sed -n '1,200p'  # OnCalendar=* - * - * 00:00:00
+systemctl is-enabled rdp-start.timer && echo "rdp-start.timer enabled"
+systemctl is-active  rdp-start.timer && echo "rdp-start.timer active"
+systemctl is-enabled rdp-stop.timer  && echo "rdp-stop.timer enabled"
+systemctl is-active  rdp-stop.timer  && echo "rdp-stop.timer active"
+systemctl show rdp-start.timer -p NextElapseUSecRealtime -p LastTriggerUSec
+systemctl show rdp-stop.timer  -p NextElapseUSecRealtime -p LastTriggerUSec
+systemd-analyze calendar '*-*-* 06:00:00'  # Confirms parsing of start timer
+systemd-analyze calendar '*-*-* 00:00:00'  # Confirms parsing of stop timer
+
+# --- Time sync via chrony (vars: timesync_enabled: true, timesync_ntp_servers: 0–3.europe.pool.ntp.org)
+systemctl is-enabled chronyd && echo "chronyd enabled"
+systemctl is-active  chronyd && echo "chronyd active"
+chronyd -v 2>/dev/null | head -1           # Chrony version
+timedatectl status                          # “System clock synchronized: yes”
+# Pools should be present in chrony config (role writes to chrony.conf/d)
+grep -E '^(server|pool)\s+(0|1|2|3)\.europe\.pool\.ntp\.org\b' \
+     /etc/chrony.conf /etc/chrony.d/*.conf 2>/dev/null || echo "NTP pools not found in config"
+chronyc sources -v                          # Look for ^* selected source, ^+ candidates
+chronyc sourcestats -v | sed -n '1,120p'
+chronyc tracking
+chronyc activity ; timedatectl show -p NTPSynchronized
+# Optional one-shot step (should not be necessary in steady state)
+# sudo chronyc -a makestep ; sleep 2 ; chronyc tracking
+journalctl -u chronyd --since "1 hour ago" --no-pager
+
+# --- Fail2ban service and jail drop (vars: fail2ban=true, jail_path=/etc/fail2ban/jail.local, banaction=firewallcmd-rich-rules)
+systemctl status fail2ban.service --no-pager
+test -f /etc/fail2ban/jail.local && echo "jail.local present" || echo "jail.local missing"
+grep -E '^\s*banaction\s*=\s*firewallcmd-rich-rules' /etc/fail2ban/jail.local && echo "banaction OK" || echo "banaction not set"
+grep -E '^\s*\[sshd\]' /etc/fail2ban/jail.local && echo "sshd jail present" || echo "sshd jail missing"
+
+# --- SELinux state + tooling (vars: selinux_state=enforcing; role installs tooling)
+getenforce                 # Expect: Enforcing (runtime)
+sestatus | head -20        # “Current mode” and “Mode from config file” should match policy
+rpm -q policycoreutils policycoreutils-python-utils libselinux-utils setools-console || true
+
+# --- Reboot markers (vars: reboot_when_required=false -> warn, write markers; true -> reboot)
+test -f /var/run/reboot-required && echo "reboot-required flag present" || echo "no reboot flag"
+[ -f /var/run/reboot-required.d/os_settings ] && echo "reboot reasons:" && cat /var/run/reboot-required.d/os_settings || true

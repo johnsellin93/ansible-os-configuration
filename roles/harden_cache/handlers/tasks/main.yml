@@ -1,0 +1,23 @@
+---
+handlers:
+  - name: dnf clean
+    become: true
+    ansible.builtin.command: dnf clean all
+    changed_when: true
+
+  - name: reload systemd daemon
+    become: true
+    ansible.builtin.command: systemctl daemon-reload
+    changed_when: false
+
+  - name: restart systemd-journald
+    become: true
+    ansible.builtin.systemd:
+      name: systemd-journald
+      state: restarted
+
+  - name: restart systemd-coredump
+    service:
+      name: systemd-coredump
+      state: restarted
+    ignore_errors: true   # service may be socket-activated or not present on some distros

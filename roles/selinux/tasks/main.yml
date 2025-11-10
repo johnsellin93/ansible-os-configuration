@@ -1,0 +1,168 @@
+# --- SELinux role summary (banner) -------------------------------------------
+- name: Build SELinux role summary banner
+  ansible.builtin.set_fact:
+    selinux_banner_msg:
+      - "SELinux role:"
+      - "  • OS scope: RHEL-family only (skipped on non-RedHat)."
+      - "  • State: selinux_state={{ selinux_state | default('enforcing') }}, policy={{ selinux_policy | default('targeted') }}."
+      - "  • Tooling: ensure policycoreutils, setools, selinux utils are present."
+      - "CIFS /opt/*-backup handling:"
+      - "  • Detect existing CIFS mounts under /opt/*-backup."
+      - "  • Re-apply mount with required SELinux context to preserve access."
+      - "Custom fcontexts:"
+      - "  • Apply sefcontext rules for defined selinux_fcontexts."
+      - "  • Run restorecon on those paths (idempotent relabel)."
+      - "AVC visibility:"
+      - "  • Tail recent SELinux AVC denials from {{ selinux_denials_log_path | default('/var/log/audit/audit.log') }}."
+      - "  • Extract and print paths seen in denials for investigation."
+      - "Reboot logic:"
+      - "  • If state change requires it (e.g. disabled→permissive/enforcing), mark os_settings_reboot_required=true."
+      - "  • Reason added: 'SELinux state change requires reboot'."
+      - "  • Reboot only when selinux_change.reboot_required=true (e.g. disabled → enabled or major policy change)."
+
+- name: Show SELinux role summary
+  ansible.builtin.debug:
+    var: selinux_banner_msg
+
+- name: Ensure existing CIFS /opt/*-backup mounts have SELinux context (RHEL only)
+  when: ansible_facts.os_family == 'RedHat'
+  block:
+
+    - name: Ensure SELinux tooling present
+      ansible.builtin.package:
+        name:
+          - policycoreutils
+          - policycoreutils-python-utils
+          - libselinux-utils
+          - setools-console
+        state: present
+
+    # Configure both persistent and (when possible) runtime state.
+    # The module handles runtime setenforce when not moving to/from 'disabled'.
+
+    - name: Set SELinux state
+      ansible.posix.selinux:
+        policy: "{{ selinux_policy }}"
+        state: "{{ selinux_state }}"
+      register: selinux_change
+
+
+
+    # If we moved to/from disabled, a reboot is required for the kernel labeler.
+    - name: Mark reboot required for SELinux state change
+      ansible.builtin.set_fact:
+        os_settings_reboot_required: true
+        os_settings_reboot_reasons: >-
+          {{ (os_settings_reboot_reasons | default([]))
+             + ['SELinux state change requires reboot'] }}
+      when: selinux_change.reboot_required | default(false)
+
+    - name: Reboot now to apply SELinux change (optional)
+      ansible.builtin.reboot:
+        msg: "Rebooting to apply SELinux state change"
+        connect_timeout: 60
+        reboot_timeout: 1200
+        pre_reboot_delay: 0
+        post_reboot_delay: 30
+        test_command: "getenforce"
+      when:
+        - selinux_change.reboot_required | default(false)
+        - reboot_when_required | default(false)
+      tags: [reboot]
+
+
+
+
+    - name: Detect existing CIFS backup mount under /opt/*-backup
+      set_fact:
+        oracle_backup_detected: >-
+          {{
+            (ansible_mounts
+             | selectattr('fstype', 'equalto', 'cifs')
+             | selectattr('mount', 'match', '^/opt/.+-backup$')
+             | list
+             | first)
+            | default({})
+          }}
+
+    - name: Set mount facts from detected backup share
+      when:
+        - oracle_backup_detected.mount is defined
+        - oracle_backup_detected.device is defined
+      set_fact:
+        oracle_backup_mount_path: "{{ oracle_backup_detected.mount }}"
+        oracle_backup_share_src: "{{ oracle_backup_detected.device }}"
+        oracle_backup_mount_opts: >-
+          {{
+            oracle_backup_detected.options | default('')
+          }}{{ ',context=system_u:object_r:var_t:s0'
+               if 'context=' not in (oracle_backup_detected.options | default('')) else '' }}
+
+    - name: Ensure Oracle backup CIFS share uses existing options + SELinux context
+      when:
+        - oracle_backup_mount_path is defined
+        - oracle_backup_share_src is defined
+      ansible.posix.mount:
+        path: "{{ oracle_backup_mount_path }}"
+        src: "{{ oracle_backup_share_src }}"
+        fstype: cifs
+        opts: "{{ oracle_backup_mount_opts }}"
+        state: mounted
+
+    - name: Ensure fcontext rules for custom paths are present
+      community.general.sefcontext:
+        target: "{{ item.path }}"
+        setype: "{{ item.setype }}"
+        state: present
+        reload: false
+      loop: "{{ selinux_fcontexts | default([]) }}"
+
+    - name: Apply SELinux contexts to custom directories
+      ansible.builtin.command: >
+        restorecon -Rv {{ item.path.split('(')[0] }}
+      register: restorecon_result
+      loop: "{{ selinux_fcontexts | default([]) }}"
+      loop_control:
+        label: "{{ item.path }}"
+      changed_when: >
+        (restorecon_result.stdout is defined) and
+        (
+          'restorecon reset' in restorecon_result.stdout or
+          'Relabeled' in restorecon_result.stdout
+        )
+      failed_when: restorecon_result.rc != 0
+
+    - name: Show recent SELinux AVC denials (raw, last 30 lines)
+      ansible.builtin.shell: |
+        if [ -f "{{ selinux_denials_log_path }}" ]; then
+          grep -i "avc" "{{ selinux_denials_log_path }}" | tail -n 30 || true
+        fi
+      register: selinux_avc_denials
+      changed_when: false
+      failed_when: false
+
+    - name: Extract AVC-related file paths from recent denials
+      when:
+        - selinux_avc_denials.stdout is defined
+        - selinux_avc_denials.stdout | trim | length > 0
+      ansible.builtin.set_fact:
+        selinux_avc_paths: >-
+          {{
+            (
+              (selinux_avc_denials.stdout | regex_findall('path="([^"]+)"'))
+              +
+              (selinux_avc_denials.stdout | regex_findall('name="([^"]+)"'))
+            )
+            | select('match', '^/')
+            | unique
+            | list
+          }}
+
+    - name: Display recent SELinux AVC file paths (for investigation)
+      when:
+        - selinux_avc_paths is defined
+        - selinux_avc_paths | length > 0
+      ansible.builtin.debug:
+        msg:
+          - "Recent SELinux AVC-related paths detected (review these for fcontext/booleans/policy):"
+          - "{{ selinux_avc_paths }}"

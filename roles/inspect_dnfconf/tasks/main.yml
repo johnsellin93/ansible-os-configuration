@@ -1,0 +1,39 @@
+---
+- name: Display dnf/yum config
+  vars:
+    dnf_path: /etc/dnf/dnf.conf
+    yum_path: /etc/yum.conf
+  block:
+    - name: Check for dnf.conf and yum.conf
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ dnf_path }}"
+        - "{{ yum_path }}"
+      register: conf_stats
+      changed_when: false
+
+    - name: Pick the file to read
+      ansible.builtin.set_fact:
+        pm_conf: >-
+          {{
+            (conf_stats.results[0].stat.exists | default(false))
+              | ternary(dnf_path,
+                        (conf_stats.results[1].stat.exists | default(false))
+                          | ternary(yum_path, ''))
+          }}
+
+    - name: Fail if neither dnf.conf nor yum.conf exists
+      ansible.builtin.fail:
+        msg: "Neither {{ dnf_path }} nor {{ yum_path }} exists on this host."
+      when: pm_conf == ''
+
+    - name: Read config
+      ansible.builtin.slurp:
+        path: "{{ pm_conf }}"
+      register: conf_raw
+      changed_when: false
+
+    - name: Print full config (line by line)
+      ansible.builtin.debug:
+        msg: "{{ (conf_raw.content | b64decode).splitlines() }}"

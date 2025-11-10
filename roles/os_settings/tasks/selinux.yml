@@ -1,0 +1,39 @@
+- name: Ensure SELinux tooling present
+  ansible.builtin.package:
+    name:
+      - policycoreutils
+      - policycoreutils-python-utils
+      - libselinux-utils
+      - setools-console
+    state: present
+
+# Configure both persistent and (when possible) runtime state.
+# The module handles runtime setenforce when not moving to/from 'disabled'.
+- name: Set SELinux state
+  ansible.posix.selinux:
+    policy: targeted
+    state: "{{ selinux_state }}"
+  register: selinux_change
+
+
+# If we moved to/from disabled, a reboot is required for the kernel labeler.
+- name: Mark reboot required for SELinux state change
+  ansible.builtin.set_fact:
+    os_settings_reboot_required: true
+    os_settings_reboot_reasons: >-
+      {{ (os_settings_reboot_reasons | default([]))
+         + ['SELinux state change requires reboot'] }}
+  when: selinux_change.reboot_required | default(false)
+
+- name: Reboot now to apply SELinux change (optional)
+  ansible.builtin.reboot:
+    msg: "Rebooting to apply SELinux state change"
+    connect_timeout: 60
+    reboot_timeout: 1200
+    pre_reboot_delay: 0
+    post_reboot_delay: 30
+    test_command: "getenforce"
+  when:
+    - selinux_change.reboot_required | default(false)
+    - reboot_when_required | default(false)
+  tags: [reboot]

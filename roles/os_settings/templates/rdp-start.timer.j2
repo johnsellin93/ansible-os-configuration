@@ -1,0 +1,10 @@
+[Unit]
+Description=Start {{ rdp_service }} at {{ rdp_timer_start }}
+
+[Timer]
+OnCalendar={{ rdp_timer_start }}
+Persistent=true
+RandomizedDelaySec=0
+
+[Install]
+WantedBy=timers.target

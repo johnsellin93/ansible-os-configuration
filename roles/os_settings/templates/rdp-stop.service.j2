@@ -1,0 +1,9 @@
+[Unit]
+Description=Stop {{ rdp_service }} (RDP)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl stop {{ rdp_service }}.service
+RemainAfterExit=no

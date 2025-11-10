@@ -1,0 +1,15 @@
+- name: Top 10 largest log files under /var/log (same filesystem only)
+  become: true
+  ansible.builtin.shell: |
+    set -o pipefail
+    LC_ALL=C find /var/log -xdev -type f -printf '%s\t%p\n' \
+      | sort -nr | head -n 10 \
+      | awk '{printf "%7.1f MB  %s\n", $1/1024/1024, $2}'
+  args:
+    executable: /bin/bash
+  register: top_logs
+  changed_when: false
+
+- name: Show top logs
+  ansible.builtin.debug:
+    msg: "{{ top_logs.stdout_lines | default(['(no files found)']) }}"

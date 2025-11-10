@@ -1,0 +1,53 @@
+# Use chrony on both Debian/Ubuntu and RHEL/Oracle
+- name: Chrony | Install & configure
+  when: timesync_enabled | bool
+  block:
+
+    - name: Ensure chrony is installed
+      package:
+        name: chrony
+        state: present
+
+    # Avoid conflicts with other NTP clients
+    - name: Disable systemd-timesyncd on Debian/Ubuntu
+      when: ansible_os_family == 'Debian'
+      systemd:
+        name: systemd-timesyncd
+        state: stopped
+        enabled: no
+      ignore_errors: yes
+
+    - name: Disable legacy ntpd if present (RHEL/Oracle)
+      when: ansible_os_family == 'RedHat'
+      systemd:
+        name: ntpd
+        state: stopped
+        enabled: no
+      ignore_errors: yes
+
+    - name: Drop chrony.conf (right path & driftfile per OS)
+      copy:
+        dest: "{{ '/etc/chrony/chrony.conf' if ansible_os_family == 'Debian' else '/etc/chrony.conf' }}"
+        mode: "0644"
+        content: |
+          {% for s in (timesync_ntp_servers | default([])) %}server {{ s }} iburst
+          {% endfor %}
+          driftfile {{ '/var/lib/chrony/chrony.drift' if ansible_os_family == 'Debian' else '/var/lib/chrony/drift' }}
+          makestep 1.0 3
+          rtcsync
+      notify: restart chrony
+
+    - name: Ensure chrony service enabled and running
+      systemd:
+        name: "{{ 'chrony' if ansible_os_family == 'Debian' else 'chronyd' }}"
+        state: started
+        enabled: yes
+
+    # Optional sanity output
+    - name: Show time status
+      command: timedatectl
+      register: tdctl
+      changed_when: false
+
+    - debug:
+        var: tdctl.stdout_lines
